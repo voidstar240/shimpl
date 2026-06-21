@@ -1,0 +1,5 @@
+.cache/
+obj/
+compile_commands.json
+libshimpl.a
+test
