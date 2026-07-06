@@ -6,7 +6,7 @@
 
 #define NULL_WINDOW 0
 
-typedef enum {
+typedef enum PLMouseButton {
     PL_MB_LEFT,
     PL_MB_RIGHT,
     PL_MB_MIDDLE,
@@ -22,7 +22,7 @@ typedef enum {
     PL_MB_COUNT,
 } PLMouseButton;
 
-typedef enum {
+typedef enum PLKey {
     // loosely based on USB keyboard scancodes (page 0x07)
     // https://usb.org/sites/default/files/hut1_7.pdf
     // Keyboard buttons
@@ -194,7 +194,7 @@ typedef enum {
     PL_KEY_COUNT,
 } PLKey;
 
-typedef enum {
+typedef enum PLEventType {
     PL_EV_NONE = 0,
     PL_EV_CLOSE,
     PL_EV_MOUSE_ENTER,
@@ -211,32 +211,32 @@ typedef enum {
     PL_EV_TEXT_INPUT,
 } PLEventType;
 
-typedef struct {
+typedef struct PLEventMotion {
     double x;
     double y;
 } PLEventMotion;
 
-typedef struct {
+typedef struct PLEventScroll {
     double h;
     double v;
     bool inverted_v : 1;
     bool inverted_h : 1;
 } PLEventScroll;
 
-typedef struct {
+typedef struct PLEventMouseButton {
     PLMouseButton button;
 } PLEventMouseButton;
 
-typedef struct {
+typedef struct PLEventKey {
     PLKey key;
 } PLEventKey;
 
-typedef struct {
+typedef struct PLEventTextInput {
     char* text;
     uint32_t text_len;
 } PLEventTextInput;
 
-typedef struct {
+typedef struct PLEvent {
     PLEventType type;
     uint32_t window;
     union {
@@ -252,7 +252,7 @@ typedef struct {
     ;
 } PLEvent;
 
-typedef struct {
+typedef struct PLButtonState {
     bool is_down : 1;
     bool just_pressed : 1;
     bool just_released : 1;
@@ -260,7 +260,7 @@ typedef struct {
     uint8_t extra_presses : 4;
 } PLButtonState;
 
-typedef struct {
+typedef struct PLWindow {
     bool valid : 1;
     bool quit : 1; // TODO this feels bad. should_quit? transient value?
     bool maximized : 1;
@@ -272,11 +272,10 @@ typedef struct {
     int32_t width;
     int32_t height;
 
-    void* _internal;
-    struct wl_surface* wl_surface; // TODO temporary
+    struct PLBackendWindow* _backend;
 } PLWindow;
 
-typedef struct {
+typedef struct PLMouse {
     double pos_x;
     double pos_y;
     float scroll_delta_v;
@@ -287,27 +286,27 @@ typedef struct {
     uint32_t focus_window;
 } PLMouse;
 
-typedef struct {
+typedef struct PLKeyboard {
     PLButtonState keys[PL_KEY_COUNT];
     uint32_t focus_window;
 } PLKeyboard;
 
-typedef struct {
+typedef struct PLState {
     PLMouse mouse;
     PLKeyboard keyboard;
     PLWindow* windows;
-    // TODO windows_size?
+    uint32_t windows_cap;
 
     PLEvent* events;
     uint32_t events_len;
+    uint32_t events_cap;
 
-    // TODO multiple input devices
+    // TODO multiple input devices?
 
-    void* _internal;
-    struct wl_display* wl_display; // TODO temporary
+    struct PLBackendState* _backend;
 } PLState;
 
-typedef enum {
+typedef enum PLErrorSeverity {
     PL_WARNING,
     PL_ERROR,
     PL_FATAL,

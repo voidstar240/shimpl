@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "shimpl.h"
+#include "shimpl-backend-linux.h"
 
 static EGLDisplay egl_display;
 static EGLConfig egl_config;
@@ -26,7 +27,7 @@ bool input_mode = false;
 
 void err_cb(uint8_t sev, const char* msg, const char* file, uint32_t line) {
     const char* sev_str[] = { "WARNING", "ERROR", "FATAL"};
-    fprintf(stderr, "[%s]: %s@%d: %s\n", sev_str[sev], file, line, msg);
+    fprintf(stderr, "[%s]: %s:%d: %s\n", sev_str[sev], file, line, msg);
 }
 
 int main(int argc, char* argv[]) {
@@ -40,7 +41,7 @@ int main(int argc, char* argv[]) {
     state.windows[win].title = "ShimPL Test";
     pl_update(&state);
 
-    init_egl(state.wl_display, state.windows[win].wl_surface);
+    init_egl(state._backend->display, state.windows[win]._backend->surface);
 
     eglSwapInterval(egl_display, 1);
     while (1) {
@@ -53,9 +54,9 @@ int main(int argc, char* argv[]) {
             //printf("EV: %d, win %d\n", state.events[i].type, state.events[i].window);
             if (state.events[i].type == PL_EV_TEXT_INPUT && input_mode) {
                 if (state.events[i].text.text[0] == '\b') {
-                    text[text_len] = '\0';
                     if (text_len > 0) {
                         text_len--;
+                        text[text_len] = '\0';
                     }
                 } else if (state.events[i].text.text[0] == '\n') {
                     printf("Exiting input mode...\n");
@@ -78,6 +79,7 @@ int main(int argc, char* argv[]) {
                 memset(text, 0, sizeof(text));
                 text_len = 0;
                 printf("Entering input mode...\n");
+                state.windows[win].title = text;
             } else {
                 input_mode = false;
             }

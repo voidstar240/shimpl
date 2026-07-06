@@ -20,7 +20,7 @@ all: compile_commands.json test
 test: obj/test.o libshimpl.a $(STATIC_LIBS)
 	$(CC) $(CFLAGS) $^ -o $@ $(DYNAMIC_LIBS)
 
-libshimpl.a: obj/shimpl-linux.o
+libshimpl.a: obj/shimpl-backend-linux.o
 	ar rcs libshimpl.a $^
 
 obj/%.o: src/%.c $(wildcard src/*.h)

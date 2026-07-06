@@ -1,103 +1,28 @@
 #include "shimpl.h"
-#include <stdio.h>
+
+#define WAYLAND_PROTOCOLS_IMPLEMENTATION
+#include "shimpl-backend-linux.h"
 
 #include <assert.h>
 #include <errno.h>
 #include <poll.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 
 #include <linux/input-event-codes.h>
-#include <xkbcommon/xkbcommon.h>
-#include <xkbcommon/xkbcommon-compose.h>
 #include <locale.h>
 
-#define WAYLAND_PROTOCOLS_IMPLEMENTATION
-#include <wayland-client.h>
-#include <cursor-shape.h>
-#include <pointer-constraints.h>
-#include <xdg-shell.h>
-#include <xdg-decoration.h>
 // REMOVE IF ADDING TABLET INTERFACE
 const struct wl_interface zwp_tablet_tool_v2_interface = {0};
 
+// TODO typedef window handle/id type
+// TODO Should NULL_WIN_ID be -1 to avoid wasted space in windows array? but
+// this breaks ZII
 #define FIRST_WIN_ID 1
-
-static PLWindow windows[128];
-static PLWindow last_windows[128];
-static PLWindow next_windows[128];
-
-static PLEvent events[1024];
 
 static PLErrorCallback g_error_callback = NULL;
 static char g_error_msg_buf[1024] = {0};
-
-typedef struct StateInternal StateInternal;
-typedef struct WindowState WindowState;
-
-struct WindowState {
-    StateInternal* state;
-
-    struct wl_surface* surface;
-    struct xdg_surface* xdg_surface;
-    struct xdg_toplevel* toplevel;
-    struct zxdg_toplevel_decoration_v1* decor;
-    uint32_t window_id;
-};
-
-#define SCROLL_AXIS_COUNT 2
-
-typedef struct {
-    double scroll[SCROLL_AXIS_COUNT];
-    int32_t scroll120[SCROLL_AXIS_COUNT];
-    uint32_t source;
-    uint8_t stop[SCROLL_AXIS_COUNT];
-    uint8_t scroll_dir[SCROLL_AXIS_COUNT];
-} WlPointerEventGroup;
-
-struct StateInternal {
-    bool initialized;
-    // wayland state
-    struct wl_display* display;
-    struct wl_registry* registry;
-    struct wl_compositor* compositor;
-    struct xdg_wm_base* xdg_wm_base;
-    struct zxdg_decoration_manager_v1* decor_manager;
-    struct wl_seat* seat;
-    struct wl_pointer* pointer;
-    struct wl_keyboard* keyboard;
-
-    uint32_t pointer_serial;
-    WlPointerEventGroup pointer_ev_group;
-    double scroll_acc[SCROLL_AXIS_COUNT];
-    double scroll120_acc[SCROLL_AXIS_COUNT];
-    double scroll_click_scale;
-
-    // xkb state
-    void* keymap_raw;
-    uint32_t keymap_raw_size;
-    struct xkb_context* xkb_ctx;
-    struct xkb_keymap* xkb_keymap;
-    struct xkb_state* xkb_state;
-    struct xkb_compose_table* xkb_compose_table;
-    struct xkb_compose_state* xkb_compose_state;
-
-    // extra
-    WindowState* window_states;
-    WindowState* next_free_window; // free list
-    uint32_t window_states_len;
-
-    PLState* last_state; // last state sent to user
-    PLState* curr_state; // current state containing user changes
-    PLState* next_state; // state to send at the end of the frame
-
-    PLState state_buf_a;
-    PLState state_buf_b;
-};
-
-static WindowState _window_states[128];
-
-static StateInternal _internal_state;
 
 #define LOG_WARNING(...) do { \
     snprintf(g_error_msg_buf, sizeof(g_error_msg_buf), __VA_ARGS__); \
@@ -118,10 +43,34 @@ static void log_error(uint8_t severity, const char* file, uint32_t line) {
     }
 }
 
-static void push_event(StateInternal* state, PLEvent ev) {
-    uint32_t cap = sizeof(events) / sizeof(events[0]);
-    assert(state->next_state->events_len < cap);
-    state->next_state->events[state->next_state->events_len++] = ev;
+static void resize_events(PLState* state, uint32_t new_cap) {
+    PLEvent* new_events = NULL;
+    if (new_cap == 0) {
+        if (state->events) {
+            free(state->events);
+            state->events_cap = 0;
+        }
+        return;
+    }
+    new_events = calloc(new_cap, sizeof(*new_events));
+    if (!new_events) {
+        LOG_FATAL("Failed to allocate events array");
+        return;
+    }
+    memset(new_events, 0, sizeof(*state->events) * new_cap);
+    if (state->events) {
+        memcpy(new_events, state->events, sizeof(*state->events) * state->events_len);
+        free(state->events);
+    }
+    state->events = new_events;
+    state->events_cap = new_cap;
+}
+
+static void push_event(PLBackendState* bstate, PLEvent ev) {
+    if (bstate->curr_state->events_len >= bstate->curr_state->events_cap) {
+        resize_events(bstate->curr_state, bstate->curr_state->events_cap * 2);
+    }
+    bstate->curr_state->events[bstate->curr_state->events_len++] = ev;
 }
 
 static void press_button(PLButtonState* button) {
@@ -349,11 +298,10 @@ static uint8_t try_bind_global(struct RegistryGlobalData* global,
 
 static void wl_registry_global(void* data, struct wl_registry* registry,
         uint32_t name, const char* interface, uint32_t version) {
-    StateInternal* state = data;
-    assert(state->registry == registry);
-    //printf("REGISTRY: got global %d: %s v%d\n", name, interface, version);
+    PLBackendState* bstate = data;
+    assert(bstate->registry == registry);
     struct RegistryGlobalData g = {
-        .registry = state->registry,
+        .registry = bstate->registry,
         .name = name,
         .interface = interface,
         .version = version,
@@ -361,18 +309,19 @@ static void wl_registry_global(void* data, struct wl_registry* registry,
 
     (void)( // avoid unused value warning
         try_bind_global(&g, &wl_compositor_interface,
-            (void**)&state->compositor)
+            (void**)&bstate->compositor)
         || try_bind_global(&g, &xdg_wm_base_interface,
-            (void**)&state->xdg_wm_base)
+            (void**)&bstate->xdg_wm_base)
         || try_bind_global(&g, &zxdg_decoration_manager_v1_interface,
-                (void**)&state->decor_manager)
+                (void**)&bstate->decor_manager)
         || try_bind_global(&g, &wl_seat_interface,
-            (void**)&state->seat)
+            (void**)&bstate->seat)
     );
 }
 
 static void wl_registry_global_remove(void* data, struct wl_registry* registry,
         uint32_t name) {
+    // TODO remove or smth
     printf("REGISTRY: removed global %d\n", name);
 }
 
@@ -385,8 +334,8 @@ static struct wl_registry_listener wl_registry_listener = {
 // BEGIN XDG_WM_BASE LISTENER
 static void xdg_wm_base_ping(void* data, struct xdg_wm_base* xdg_wm_base,
         uint32_t serial) {
-    StateInternal* state = data;
-    assert(state->xdg_wm_base == xdg_wm_base);
+    PLBackendState* bstate = data;
+    assert(bstate->xdg_wm_base == xdg_wm_base);
     xdg_wm_base_pong(xdg_wm_base, serial);
 }
 
@@ -399,59 +348,59 @@ static struct xdg_wm_base_listener xdg_wm_base_listener = {
 void wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
         uint32_t serial, struct wl_surface *surface, wl_fixed_t surface_x,
         wl_fixed_t surface_y) {
-    StateInternal* state = data;
-    state->pointer_serial = serial;
-    state->next_state->mouse.pos_x = wl_fixed_to_double(surface_x);
-    state->next_state->mouse.pos_y = wl_fixed_to_double(surface_y);
+    PLBackendState* bstate = data;
+    bstate->pointer_serial = serial;
+    bstate->curr_state->mouse.pos_x = wl_fixed_to_double(surface_x);
+    bstate->curr_state->mouse.pos_y = wl_fixed_to_double(surface_y);
     // TODO update cursor image
 
-    WindowState* win_state = wl_proxy_get_user_data((void*)surface);
-    if (win_state) {
-        state->next_state->windows[win_state->window_id].has_mouse_focus = true;
-        state->next_state->mouse.focus_window = win_state->window_id;
+    PLBackendWindow* bwin = wl_proxy_get_user_data((void*)surface);
+    if (bwin) {
+        bstate->curr_state->windows[bwin->window_id].has_mouse_focus = true;
+        bstate->curr_state->mouse.focus_window = bwin->window_id;
         PLEvent ev = { 0 };
         ev.type = PL_EV_MOUSE_ENTER;
-        ev.window = win_state->window_id;
-        push_event(state, ev);
+        ev.window = bwin->window_id;
+        push_event(bstate, ev);
     }
 }
 
 void wl_pointer_leave(void *data, struct wl_pointer *wl_pointer,
         uint32_t serial, struct wl_surface *surface) {
-    StateInternal* state = data;
-    state->pointer_serial = serial;
+    PLBackendState* bstate = data;
+    bstate->pointer_serial = serial;
 
-    WindowState* win_state = wl_proxy_get_user_data((void*)surface);
-    if (win_state) {
-        state->next_state->windows[win_state->window_id].has_mouse_focus = false;
-        state->next_state->mouse.focus_window = 0;
+    PLBackendWindow* bwin = wl_proxy_get_user_data((void*)surface);
+    if (bwin) {
+        bstate->curr_state->windows[bwin->window_id].has_mouse_focus = false;
+        bstate->curr_state->mouse.focus_window = 0;
         PLEvent ev = { 0 };
         ev.type = PL_EV_MOUSE_LEAVE;
-        ev.window = win_state->window_id;
-        push_event(state, ev);
+        ev.window = bwin->window_id;
+        push_event(bstate, ev);
     }
 }
 
 void wl_pointer_motion(void *data, struct wl_pointer *wl_pointer, uint32_t time,
         wl_fixed_t surface_x, wl_fixed_t surface_y) {
-    StateInternal* state = data;
-    state->next_state->mouse.pos_x = wl_fixed_to_double(surface_x);
-    state->next_state->mouse.pos_y = wl_fixed_to_double(surface_y);
+    PLBackendState* bstate = data;
+    bstate->curr_state->mouse.pos_x = wl_fixed_to_double(surface_x);
+    bstate->curr_state->mouse.pos_y = wl_fixed_to_double(surface_y);
 
     // TODO compute relative pointer motion if extension isn't available
 
     PLEvent ev = { 0 };
     ev.type = PL_EV_MOUSE_MOTION;
-    ev.window = state->next_state->mouse.focus_window;
+    ev.window = bstate->curr_state->mouse.focus_window;
     ev.motion.x = wl_fixed_to_double(surface_x);
     ev.motion.y = wl_fixed_to_double(surface_y);
-    push_event(state, ev);
+    push_event(bstate, ev);
 }
 
 void wl_pointer_button(void *data, struct wl_pointer *wl_pointer,
         uint32_t serial, uint32_t time, uint32_t button, uint32_t but_state) {
-    StateInternal* state = data;
-    state->pointer_serial = serial;
+    PLBackendState* bstate = data;
+    bstate->pointer_serial = serial;
 
     PLMouseButton mb = evcode2mb(button);
     if (mb == PL_MB_COUNT) {
@@ -460,22 +409,22 @@ void wl_pointer_button(void *data, struct wl_pointer *wl_pointer,
     }
 
     PLEvent ev = { 0 };
-    ev.window = state->next_state->mouse.focus_window;
+    ev.window = bstate->curr_state->mouse.focus_window;
     ev.mouse_button.button = mb;
     switch (but_state) {
         case WL_POINTER_BUTTON_STATE_RELEASED:
             ev.type = PL_EV_BUTTON_RELEASE;
-            release_button(&state->next_state->mouse.buttons[mb]);
+            release_button(&bstate->curr_state->mouse.buttons[mb]);
             break;
         case WL_POINTER_BUTTON_STATE_PRESSED:
             ev.type = PL_EV_BUTTON_PRESS;
-            press_button(&state->next_state->mouse.buttons[mb]);
+            press_button(&bstate->curr_state->mouse.buttons[mb]);
             break;
         default:
             LOG_WARNING("got invalid wl_pointer button state: %d", but_state);
             return;
     }
-    push_event(state, ev);
+    push_event(bstate, ev);
 }
 
 // snap scroll vector to nearest axis within 'a' degrees
@@ -486,38 +435,38 @@ static void scroll_dir_snap(double* v, double* h, double tan_a) {
     *h = (tan_a * (*v) > *h) ? 0 : *h;
 }
 
-static void send_scroll_button(StateInternal* state, PLMouseButton button) {
+static void send_scroll_button(PLBackendState* bstate, PLMouseButton button) {
     PLEvent ev = { 0 };
     ev.type = PL_EV_BUTTON_PRESS;
-    ev.window = state->next_state->mouse.focus_window;
+    ev.window = bstate->curr_state->mouse.focus_window;
     ev.mouse_button.button = button;
-    push_event(state, ev);
-    press_button(&state->next_state->mouse.buttons[button]);
-    release_button(&state->next_state->mouse.buttons[button]);
+    push_event(bstate, ev);
+    press_button(&bstate->curr_state->mouse.buttons[button]);
+    release_button(&bstate->curr_state->mouse.buttons[button]);
 }
 
-static void send_pointer_events(StateInternal* state) {
+static void send_pointer_events(PLBackendState* bstate) {
     uint32_t v = WL_POINTER_AXIS_VERTICAL_SCROLL;
     uint32_t h = WL_POINTER_AXIS_HORIZONTAL_SCROLL;
     PLMouseButton scroll_pos[] = { PL_MB_WHEELDOWN, PL_MB_WHEELRIGHT };
     PLMouseButton scroll_neg[] = { PL_MB_WHEELUP, PL_MB_WHEELLEFT };
 
-    WlPointerEventGroup* events = &state->pointer_ev_group;
+    WlPointerEventGroup* events = &bstate->pointer_ev_group;
 
-    state->next_state->mouse.scroll_delta_v = events->scroll[v];
-    state->next_state->mouse.scroll_delta_h = events->scroll[h];
-    state->next_state->mouse.scroll_inverted_v = events->scroll_dir[v];
-    state->next_state->mouse.scroll_inverted_h = events->scroll_dir[h];
+    bstate->curr_state->mouse.scroll_delta_v = events->scroll[v];
+    bstate->curr_state->mouse.scroll_delta_h = events->scroll[h];
+    bstate->curr_state->mouse.scroll_inverted_v = events->scroll_dir[v];
+    bstate->curr_state->mouse.scroll_inverted_h = events->scroll_dir[h];
 
     if ((events->scroll[v] != 0) || (events->scroll[h] != 0)) {
         PLEvent ev = { 0 };
         ev.type = PL_EV_SCROLL;
-        ev.window = state->next_state->mouse.focus_window;
+        ev.window = bstate->curr_state->mouse.focus_window;
         ev.scroll.v = events->scroll[v];
         ev.scroll.h = events->scroll[h];
         ev.scroll.inverted_v = events->scroll_dir[v];
         ev.scroll.inverted_h = events->scroll_dir[h];
-        push_event(state, ev);
+        push_event(bstate, ev);
     }
 
     // snap scroll vector to prevent discrete scroll events from slowly
@@ -528,35 +477,35 @@ static void send_pointer_events(StateInternal* state) {
     // send discrete scroll events
     for (uint8_t axis = 0; axis < SCROLL_AXIS_COUNT; axis++) {
         if (events->scroll120[axis] != 0.0) {
-            state->scroll120_acc[axis] += events->scroll120[axis];
-            while (state->scroll120_acc[axis] >= 120) {
-                state->scroll120_acc[axis] -= 120;
-                send_scroll_button(state, scroll_pos[axis]);
+            bstate->scroll120_acc[axis] += events->scroll120[axis];
+            while (bstate->scroll120_acc[axis] >= 120) {
+                bstate->scroll120_acc[axis] -= 120;
+                send_scroll_button(bstate, scroll_pos[axis]);
             }
-            while (state->scroll120_acc[axis] <= -120) {
-                state->scroll120_acc[axis] += 120;
-                send_scroll_button(state, scroll_neg[axis]);
+            while (bstate->scroll120_acc[axis] <= -120) {
+                bstate->scroll120_acc[axis] += 120;
+                send_scroll_button(bstate, scroll_neg[axis]);
             }
             // we got discrete scroll event. no need to produce one manually
-            state->scroll_acc[axis] = 0;
+            bstate->scroll_acc[axis] = 0;
         } else if (events->scroll[axis] != 0.0) {
             // got no discrete scroll event. accumulate axis events and push
             // discrete scroll manually
-            state->scroll_acc[axis] += events->scroll[axis] *
-                state->scroll_click_scale;
-            while (state->scroll_acc[axis] >= 1.0) {
-                state->scroll_acc[axis] -= 1.0;
-                if (state->scroll_acc[axis] < 0.0) {
-                    state->scroll_acc[axis] = 0.0;
+            bstate->scroll_acc[axis] += events->scroll[axis] *
+                bstate->scroll_click_scale;
+            while (bstate->scroll_acc[axis] >= 1.0) {
+                bstate->scroll_acc[axis] -= 1.0;
+                if (bstate->scroll_acc[axis] < 0.0) {
+                    bstate->scroll_acc[axis] = 0.0;
                 }
-                send_scroll_button(state, scroll_pos[axis]);
+                send_scroll_button(bstate, scroll_pos[axis]);
             }
-            while (state->scroll_acc[axis] <= -1.0) {
-                state->scroll_acc[axis] += 1.0;
-                if (state->scroll_acc[axis] > 0.0) {
-                    state->scroll_acc[axis] = 0.0;
+            while (bstate->scroll_acc[axis] <= -1.0) {
+                bstate->scroll_acc[axis] += 1.0;
+                if (bstate->scroll_acc[axis] > 0.0) {
+                    bstate->scroll_acc[axis] = 0.0;
                 }
-                send_scroll_button(state, scroll_neg[axis]);
+                send_scroll_button(bstate, scroll_neg[axis]);
             }
         }
     }
@@ -567,51 +516,51 @@ static void send_pointer_events(StateInternal* state) {
 
 void wl_pointer_axis(void *data, struct wl_pointer *wl_pointer, uint32_t time,
         uint32_t axis, wl_fixed_t value) {
-    StateInternal* state = data;
-    state->pointer_ev_group.scroll[axis] += wl_fixed_to_double(value);
+    PLBackendState* bstate = data;
+    bstate->pointer_ev_group.scroll[axis] += wl_fixed_to_double(value);
     if (wl_proxy_get_version((void*)wl_pointer) < 5) {
         // <v5 no frame event. send events manually
-        send_pointer_events(state);
+        send_pointer_events(bstate);
     }
 }
 
 // since 5
 void wl_pointer_frame(void *data, struct wl_pointer *wl_pointer) {
-    StateInternal* state = data;
-    send_pointer_events(state);
+    PLBackendState* bstate = data;
+    send_pointer_events(bstate);
 }
 
 // since 5
 void wl_pointer_axis_source(void *data, struct wl_pointer *wl_pointer,
         uint32_t axis_source) {
     // what "device" generated the axis event (wheel, finger, etc.)
-    StateInternal* state = data;
-    state->pointer_ev_group.source = axis_source;
+    PLBackendState* bstate = data;
+    bstate->pointer_ev_group.source = axis_source;
 }
 
 // since 5
 void wl_pointer_axis_stop(void *data, struct wl_pointer *wl_pointer,
         uint32_t time, uint32_t axis) {
     // called when user lifts finger stopping a scroll event
-    StateInternal* state = data;
-    state->pointer_ev_group.stop[axis] = 1;
+    PLBackendState* bstate = data;
+    bstate->pointer_ev_group.stop[axis] = 1;
 }
 
 // since 5 deprecated since 8
 void wl_pointer_axis_discrete(void *data, struct wl_pointer *wl_pointer,
         uint32_t axis, int32_t discrete) {
     // called every "click" of the scroll wheel
-    StateInternal* state = data;
+    PLBackendState* bstate = data;
     if (wl_proxy_get_version((void*)wl_pointer) >= 8) { return; }
-    state->pointer_ev_group.scroll120[axis] += 120 * discrete;
+    bstate->pointer_ev_group.scroll120[axis] += 120 * discrete;
 }
 
 // since 8
 void wl_pointer_axis_value120(void *data, struct wl_pointer *wl_pointer,
         uint32_t axis, int32_t value120) {
     // replaces axis_discrete. every 120 is one click of wheel
-    StateInternal* state = data;
-    state->pointer_ev_group.scroll120[axis] += value120;
+    PLBackendState* bstate = data;
+    bstate->pointer_ev_group.scroll120[axis] += value120;
 }
 
 // since 9
@@ -619,8 +568,8 @@ void wl_pointer_axis_relative_direction(void *data,
         struct wl_pointer *wl_pointer, uint32_t axis, uint32_t direction) {
     // reports whether the users action (scroll, swipe, etc.) is in the same
     // direction as the scroll (reverse/natural scrolling)
-    StateInternal* state = data;
-    state->pointer_ev_group.scroll_dir[axis] = direction;
+    PLBackendState* bstate = data;
+    bstate->pointer_ev_group.scroll_dir[axis] = direction;
 }
 
 static struct wl_pointer_listener pointer_listener = {
@@ -641,22 +590,22 @@ static struct wl_pointer_listener pointer_listener = {
 // BEGIN WL_KEYBOARD LISTENER
 static void wl_keyboard_keymap(void *data, struct wl_keyboard *wl_keyboard,
         uint32_t format, int32_t fd, uint32_t size) {
-    StateInternal* state = data;
+    PLBackendState* bstate = data;
 
-    if (state->xkb_compose_state) {
-        xkb_compose_state_unref(state->xkb_compose_state);
-        state->xkb_compose_state = NULL;
+    if (bstate->xkb_compose_state) {
+        xkb_compose_state_unref(bstate->xkb_compose_state);
+        bstate->xkb_compose_state = NULL;
     }
-    if (state->xkb_state) {
-        xkb_state_unref(state->xkb_state);
-        state->xkb_state = NULL;
+    if (bstate->xkb_state) {
+        xkb_state_unref(bstate->xkb_state);
+        bstate->xkb_state = NULL;
     }
-    if (state->xkb_keymap) {
-        xkb_keymap_unref(state->xkb_keymap);
-        state->xkb_keymap = NULL;
+    if (bstate->xkb_keymap) {
+        xkb_keymap_unref(bstate->xkb_keymap);
+        bstate->xkb_keymap = NULL;
     }
-    if (state->keymap_raw) {
-        munmap(state->keymap_raw, state->keymap_raw_size);
+    if (bstate->keymap_raw) {
+        munmap(bstate->keymap_raw, bstate->keymap_raw_size);
     }
 
     if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
@@ -664,30 +613,30 @@ static void wl_keyboard_keymap(void *data, struct wl_keyboard *wl_keyboard,
         return;
     }
 
-    state->keymap_raw_size = size;
-    state->keymap_raw = mmap(NULL, state->keymap_raw_size,
+    bstate->keymap_raw_size = size;
+    bstate->keymap_raw = mmap(NULL, bstate->keymap_raw_size,
             PROT_READ, MAP_PRIVATE, fd, 0);
-    if (!state->keymap_raw) {
+    if (!bstate->keymap_raw) {
         LOG_ERROR("failed to memory map keymap");
         return;
     }
-    state->xkb_keymap = xkb_keymap_new_from_string(state->xkb_ctx,
-            state->keymap_raw, XKB_KEYMAP_FORMAT_TEXT_V1,
+    bstate->xkb_keymap = xkb_keymap_new_from_string(bstate->xkb_ctx,
+            bstate->keymap_raw, XKB_KEYMAP_FORMAT_TEXT_V1,
             XKB_KEYMAP_COMPILE_NO_FLAGS);
-    if (!state->xkb_keymap) {
+    if (!bstate->xkb_keymap) {
         LOG_ERROR("failed to create xkb_keymap");
         return;
     }
 
-    state->xkb_state = xkb_state_new(state->xkb_keymap);
-    if (!state->xkb_state) {
+    bstate->xkb_state = xkb_state_new(bstate->xkb_keymap);
+    if (!bstate->xkb_state) {
         LOG_ERROR("failed to create xkb_state");
         return;
     }
 
-    if (state->xkb_compose_table) {
-        state->xkb_compose_state = xkb_compose_state_new(state->xkb_compose_table, XKB_COMPOSE_STATE_NO_FLAGS);
-        if (!state->xkb_compose_state) {
+    if (bstate->xkb_compose_table) {
+        bstate->xkb_compose_state = xkb_compose_state_new(bstate->xkb_compose_table, XKB_COMPOSE_STATE_NO_FLAGS);
+        if (!bstate->xkb_compose_state) {
             LOG_WARNING("failed to create xkb_compose_state");
             return;
         }
@@ -696,39 +645,38 @@ static void wl_keyboard_keymap(void *data, struct wl_keyboard *wl_keyboard,
 
 static void wl_keyboard_enter(void *data, struct wl_keyboard *wl_keyboard,
         uint32_t serial, struct wl_surface *surface, struct wl_array *keys) {
-    StateInternal* state = data;
-    WindowState* win_state = wl_proxy_get_user_data((void*)surface);
-    PLWindow* window = &state->next_state->windows[win_state->window_id];
-    if (win_state) {
+    PLBackendState* bstate = data;
+    PLBackendWindow* bwin = wl_proxy_get_user_data((void*)surface);
+    PLWindow* window = &bstate->curr_state->windows[bwin->window_id];
+    if (bwin) {
         window->has_keyboard_focus = true;
-        state->next_state->keyboard.focus_window = win_state->window_id;
+        bstate->curr_state->keyboard.focus_window = bwin->window_id;
         PLEvent ev = { 0 };
         ev.type = PL_EV_KEYBOARD_ENTER;
-        ev.window = win_state->window_id;
-        push_event(state, ev);
+        ev.window = bwin->window_id;
+        push_event(bstate, ev);
     }
 
     uint32_t* key = NULL;
     wl_array_for_each(key, keys) {
         PLKey pl_key = evcode2key(*key);
-        state->next_state->keyboard.keys[pl_key].is_down = true;
+        bstate->curr_state->keyboard.keys[pl_key].is_down = true;
         // "do not emulate key press events" -wl_keyboard::enter desc.
     }
-
 }
 
 static void wl_keyboard_leave(void *data, struct wl_keyboard *wl_keyboard,
         uint32_t serial, struct wl_surface *surface) {
-    StateInternal* state = data;
-    WindowState* win_state = wl_proxy_get_user_data((void*)surface);
-    PLWindow* window = &state->next_state->windows[win_state->window_id];
-    if (win_state) {
+    PLBackendState* bstate = data;
+    PLBackendWindow* bwin = wl_proxy_get_user_data((void*)surface);
+    PLWindow* window = &bstate->curr_state->windows[bwin->window_id];
+    if (bwin) {
         window->has_keyboard_focus = true;
-        state->next_state->keyboard.focus_window = 0;
+        bstate->curr_state->keyboard.focus_window = 0;
         PLEvent ev = { 0 };
         ev.type = PL_EV_KEYBOARD_LEAVE;
-        ev.window = win_state->window_id;
-        push_event(state, ev);
+        ev.window = bwin->window_id;
+        push_event(bstate, ev);
     }
 }
 
@@ -754,64 +702,64 @@ static size_t clean_utf8_string(char* str, size_t len) {
 
 static void wl_keyboard_key(void *data, struct wl_keyboard *wl_keyboard,
         uint32_t serial, uint32_t time, uint32_t key, uint32_t but_state) {
-    StateInternal* state = data;
+    PLBackendState* bstate = data;
     PLKey pl_key = evcode2key(key);
     PLEvent ev = { 0 };
-    ev.window = state->next_state->keyboard.focus_window;
+    ev.window = bstate->curr_state->keyboard.focus_window;
     switch (but_state) {
         case WL_KEYBOARD_KEY_STATE_RELEASED:
-            release_button(&state->next_state->keyboard.keys[pl_key]);
+            release_button(&bstate->curr_state->keyboard.keys[pl_key]);
             ev.type = PL_EV_KEY_RELEASE;
-            push_event(state, ev);
+            push_event(bstate, ev);
             return;
         case WL_KEYBOARD_KEY_STATE_PRESSED:
-            press_button(&state->next_state->keyboard.keys[pl_key]);
+            press_button(&bstate->curr_state->keyboard.keys[pl_key]);
             ev.type = PL_EV_KEY_PRESS;
             // TODO manually produce key repeat events if wl_keyboard <v10
             break;
         case WL_KEYBOARD_KEY_STATE_REPEATED: // since 10
-            repeat_button(&state->next_state->keyboard.keys[pl_key]);
+            repeat_button(&bstate->curr_state->keyboard.keys[pl_key]);
             ev.type = PL_EV_KEY_REPEAT;
             break;
     }
-    push_event(state, ev);
+    push_event(bstate, ev);
 
     const xkb_keysym_t* syms;
-    int syms_len = xkb_state_key_get_syms(state->xkb_state, key + 8, &syms);
+    int syms_len = xkb_state_key_get_syms(bstate->xkb_state, key + 8, &syms);
     uint32_t utf8_len = 0;
     char* utf8_buf = NULL;
-    if (state->xkb_compose_state) {
+    if (bstate->xkb_compose_state) {
         for (int i = 0; i < syms_len; i++) {
-            xkb_compose_state_feed(state->xkb_compose_state, syms[i]);
+            xkb_compose_state_feed(bstate->xkb_compose_state, syms[i]);
         }
-        switch (xkb_compose_state_get_status(state->xkb_compose_state)) {
+        switch (xkb_compose_state_get_status(bstate->xkb_compose_state)) {
             case XKB_COMPOSE_NOTHING:
-                utf8_len = xkb_state_key_get_utf8(state->xkb_state, key + 8, NULL, 0) + 1;
+                utf8_len = xkb_state_key_get_utf8(bstate->xkb_state, key + 8, NULL, 0) + 1;
                 utf8_buf = malloc(utf8_len);
-                xkb_state_key_get_utf8(state->xkb_state, key + 8, utf8_buf, utf8_len);
+                xkb_state_key_get_utf8(bstate->xkb_state, key + 8, utf8_buf, utf8_len);
                 break;
             case XKB_COMPOSE_COMPOSED:
-                utf8_len = xkb_compose_state_get_utf8(state->xkb_compose_state, NULL, 0) + 1;
+                utf8_len = xkb_compose_state_get_utf8(bstate->xkb_compose_state, NULL, 0) + 1;
                 utf8_buf =  malloc(utf8_len);
-                utf8_len = xkb_compose_state_get_utf8(state->xkb_compose_state, utf8_buf, utf8_len);
+                utf8_len = xkb_compose_state_get_utf8(bstate->xkb_compose_state, utf8_buf, utf8_len);
                 break;
             case XKB_COMPOSE_COMPOSING:
             case XKB_COMPOSE_CANCELLED:
                 break;
         }
     } else {
-        utf8_len = xkb_state_key_get_utf8(state->xkb_state, key + 8, NULL, 0) + 1;
+        utf8_len = xkb_state_key_get_utf8(bstate->xkb_state, key + 8, NULL, 0) + 1;
         utf8_buf = malloc(utf8_len);
-        xkb_state_key_get_utf8(state->xkb_state, key + 8, utf8_buf, utf8_len);
+        xkb_state_key_get_utf8(bstate->xkb_state, key + 8, utf8_buf, utf8_len);
     }
     utf8_len = clean_utf8_string(utf8_buf, utf8_len);
     if (utf8_len > 0) {
         PLEvent text_ev = { 0 };
         text_ev.type = PL_EV_TEXT_INPUT;
-        text_ev.window = state->next_state->keyboard.focus_window;
+        text_ev.window = bstate->curr_state->keyboard.focus_window;
         text_ev.text.text = utf8_buf;
         text_ev.text.text_len = utf8_len;
-        push_event(state, text_ev);
+        push_event(bstate, text_ev);
     }
     // TODO utf8_buf gets leaked. make temp alloc or something
 }
@@ -819,9 +767,9 @@ static void wl_keyboard_key(void *data, struct wl_keyboard *wl_keyboard,
 static void wl_keyboard_modifiers(void *data, struct wl_keyboard *wl_keyboard,
         uint32_t serial, uint32_t mods_depressed, uint32_t mods_latched,
         uint32_t mods_locked, uint32_t group) {
-    StateInternal* state = data;
-    if (state->xkb_state) {
-        xkb_state_update_mask(state->xkb_state, mods_depressed, mods_latched,
+    PLBackendState* bstate = data;
+    if (bstate->xkb_state) {
+        xkb_state_update_mask(bstate->xkb_state, mods_depressed, mods_latched,
                 mods_locked, 0, 0, group);
     }
 }
@@ -848,33 +796,33 @@ static struct wl_keyboard_listener keyboard_listener = {
 // BEGIN WL_SEAT LISTENER
 static void wl_seat_capabilities(void *data, struct wl_seat *wl_seat,
         uint32_t capabilities) {
-    StateInternal* state = data;
+    PLBackendState* bstate = data;
 
     if (capabilities & WL_SEAT_CAPABILITY_POINTER) {
-        if (!state->pointer) {
-            state->pointer = wl_seat_get_pointer(wl_seat);
-            wl_pointer_add_listener(state->pointer, &pointer_listener, state);
+        if (!bstate->pointer) {
+            bstate->pointer = wl_seat_get_pointer(wl_seat);
+            wl_pointer_add_listener(bstate->pointer, &pointer_listener, bstate);
         }
     } else {
-        if (state->pointer) {
-            if (wl_proxy_get_version((void*)state->pointer) >= 3) {
-                wl_pointer_release(state->pointer);
-                state->pointer = NULL;
+        if (bstate->pointer) {
+            if (wl_proxy_get_version((void*)bstate->pointer) >= 3) {
+                wl_pointer_release(bstate->pointer);
+                bstate->pointer = NULL;
             }
         }
     }
 
     if (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) {
-        if (!state->keyboard) {
-            state->keyboard = wl_seat_get_keyboard(wl_seat);
-            wl_keyboard_add_listener(state->keyboard,
-                    &keyboard_listener, state);
+        if (!bstate->keyboard) {
+            bstate->keyboard = wl_seat_get_keyboard(wl_seat);
+            wl_keyboard_add_listener(bstate->keyboard,
+                    &keyboard_listener, bstate);
         }
     } else {
-        if (state->keyboard) {
-            if (wl_proxy_get_version((void*)state->keyboard) >= 3) {
-                wl_keyboard_release(state->keyboard);
-                state->keyboard = NULL;
+        if (bstate->keyboard) {
+            if (wl_proxy_get_version((void*)bstate->keyboard) >= 3) {
+                wl_keyboard_release(bstate->keyboard);
+                bstate->keyboard = NULL;
             }
         }
     }
@@ -930,8 +878,8 @@ static struct wl_surface_listener wl_surface_listener = {
 // BEGIN XDG_SURFACE LISTENER
 static void xdg_surface_configure(void* data, struct xdg_surface* xdg_surface,
         uint32_t serial) {
-    WindowState* ws = data;
-    assert(ws->xdg_surface == xdg_surface);
+    PLBackendWindow* bwin = data;
+    assert(bwin->xdg_surface == xdg_surface);
     xdg_surface_ack_configure(xdg_surface, serial);
 }
 
@@ -943,9 +891,9 @@ static struct xdg_surface_listener xdg_surface_listener = {
 // BEGIN XDG_TOPLEVEL LISTENER
 static void xdg_toplevel_configure(void* data, struct xdg_toplevel* toplevel,
         int32_t width, int32_t height, struct wl_array* states) {
-    WindowState* ws = data;
-    assert(ws->toplevel == toplevel);
-    PLWindow* win = &ws->state->next_state->windows[ws->window_id];
+    PLBackendWindow* bwin = data;
+    assert(bwin->toplevel == toplevel);
+    PLWindow* win = &bwin->bstate->curr_state->windows[bwin->window_id];
     win->width = width;
     win->height = height;
     win->maximized = false;
@@ -967,29 +915,29 @@ static void xdg_toplevel_configure(void* data, struct xdg_toplevel* toplevel,
 }
 
 static void xdg_toplevel_close(void* data, struct xdg_toplevel* toplevel) {
-    WindowState* ws = data;
-    assert(ws->toplevel == toplevel);
-    StateInternal* state_i = ws->state;
-    PLState* state = state_i->next_state;
-    PLWindow* window = &state->windows[ws->window_id];
+    PLBackendWindow* bwin = data;
+    assert(bwin->toplevel == toplevel);
+    PLBackendState* bstate = bwin->bstate;
+    PLState* state = bstate->curr_state;
+    PLWindow* window = &state->windows[bwin->window_id];
     window->quit = true;
     PLEvent ev = { 0 };
     ev.type = PL_EV_CLOSE;
-    ev.window = ws->window_id;
-    push_event(state_i, ev);
+    ev.window = bwin->window_id;
+    push_event(bstate, ev);
 }
 
 static void xdg_toplevel_configure_bounds(void* data,
         struct xdg_toplevel* toplevel, int32_t width, int32_t height) {
-    WindowState* ws = data;
-    assert(ws->toplevel == toplevel);
+    PLBackendWindow* bwin = data;
+    assert(bwin->toplevel == toplevel);
     // STUB
 }
 
 static void xdg_toplevel_wm_capabilities(void* data,
         struct xdg_toplevel* toplevel, struct wl_array* capabilities) {
-    WindowState* ws = data;
-    assert(ws->toplevel == toplevel);
+    PLBackendWindow* bwin = data;
+    assert(bwin->toplevel == toplevel);
     // STUB
 }
 
@@ -1004,11 +952,11 @@ static struct xdg_toplevel_listener xdg_toplevel_listener = {
 // BEGIN XDG_TOPLEVEL_DECORATION LISTENER
 static void xdg_toplevel_decoration_configure(void* data,
         struct zxdg_toplevel_decoration_v1* decor, uint32_t mode) {
-    WindowState* ws = data;
-    assert(ws->decor == decor);
-    StateInternal* state_i = ws->state;
-    PLState* state = state_i->next_state;
-    PLWindow* window = &state->windows[ws->window_id];
+    PLBackendWindow* bwin = data;
+    assert(bwin->decor == decor);
+    PLBackendState* bstate = bwin->bstate;
+    PLState* state = bstate->curr_state;
+    PLWindow* window = &state->windows[bwin->window_id];
     switch (mode) {
         case ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE:
             window->no_decorations = true;
@@ -1031,89 +979,113 @@ xdg_toplevel_decoration_listener = {
 
 // END WAYLAND LISTENERS
 
-// this does not allocate. arrays must be set on dest before calling
 static void deep_copy_state(PLState* dest, PLState* src) {
-    // TODO pointers need to be deep copied (window->title)
-    memcpy(dest->windows, src->windows, sizeof(windows));
+    if (dest->windows && src->windows) {
+        for (uint32_t i = 0; i < dest->windows_cap; i++) {
+            char* title = dest->windows[i].title;
+            memcpy(&dest->windows[i], &src->windows[i], sizeof(*src->windows));
+            dest->windows[i].title = title;
+        }
+    }
     PLWindow* windows = dest->windows;
     memcpy(dest, src, sizeof(*dest));
     dest->windows = windows;
 }
 
-static void init_state_internal(StateInternal* s, PLState* state) {
-    if (!s) { return; }
-    if (s->initialized) { return; }
-    memset(s, 0, sizeof(*s));
-    memset(_window_states, 0, sizeof(_window_states));
+static void resize_windows(PLBackendState* bstate, uint32_t new_cap) {
+    PLWindow* curr_wins = bstate->curr_state->windows;
+    PLWindow* last_wins = bstate->last_state->windows;
+    PLWindow* new_curr_wins = NULL;
+    PLWindow* new_last_wins = NULL;
+    uint32_t curr_cap = bstate->curr_state->windows_cap;
+    uint32_t curr_bytes = sizeof(*curr_wins) * curr_cap;
+    if (new_cap > 0) {
+        new_curr_wins = calloc(new_cap * 2, sizeof(*curr_wins));
+        if (!new_curr_wins) {
+            LOG_FATAL("Failed to allocate windows array");
+            return;
+        }
+        new_last_wins = new_curr_wins + new_cap;
+        if (last_wins) {
+            memcpy(new_last_wins, last_wins, curr_bytes);
+        }
+        if (curr_wins) {
+            memcpy(new_curr_wins, curr_wins, curr_bytes);
+        }
+    }
+    if (curr_wins) {
+        free(curr_wins);
+    }
+    bstate->curr_state->windows = new_curr_wins;
+    bstate->last_state->windows = new_last_wins;
+    bstate->curr_state->windows_cap = new_cap;
+    bstate->last_state->windows_cap = new_cap;
+}
 
-    s->scroll_click_scale = 1.0 / 15.0;
+static void init_backend_state(PLBackendState* bstate, PLState* state) {
+    if (!bstate) { return; }
+    memset(bstate, 0, sizeof(*bstate));
 
-    s->display = wl_display_connect(NULL);
-    if (!s->display) {
+    bstate->scroll_click_scale = 1.0 / 15.0;
+
+    bstate->display = wl_display_connect(NULL);
+    if (!bstate->display) {
         LOG_FATAL("failed to connect to wayland display");
-        assert(0);
         return;
     }
-    s->registry = wl_display_get_registry(s->display);
-    if (!s->display) {
+    bstate->registry = wl_display_get_registry(bstate->display);
+    if (!bstate->display) {
         LOG_FATAL("failed to get wl_registry");
-        assert(0);
         return;
     }
-    wl_registry_add_listener(s->registry, &wl_registry_listener, s);
-    wl_display_roundtrip(s->display);
+    wl_registry_add_listener(bstate->registry, &wl_registry_listener, bstate);
+    wl_display_roundtrip(bstate->display);
 
-    if (!s->compositor) {
+    if (!bstate->compositor) {
         LOG_FATAL("failed to get wl_compositor");
-        assert(0);
         return;
     }
-    if (!s->xdg_wm_base) {
+    if (!bstate->xdg_wm_base) {
         LOG_FATAL("failed to get xdg_wm_base");
-        assert(0);
         return;
     }
-    xdg_wm_base_add_listener(s->xdg_wm_base, &xdg_wm_base_listener, s);
+    xdg_wm_base_add_listener(bstate->xdg_wm_base, &xdg_wm_base_listener, bstate);
 
-    if (s->seat) {
-        wl_seat_add_listener(s->seat, &wl_seat_listener, s);
+    if (bstate->seat) {
+        wl_seat_add_listener(bstate->seat, &wl_seat_listener, bstate);
     }
 
-    s->xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_DEFAULT_INCLUDES);
-    if (s->xkb_ctx) {
-        s->xkb_compose_table = xkb_compose_table_new_from_locale(s->xkb_ctx, setlocale(LC_CTYPE, NULL), XKB_COMPOSE_COMPILE_NO_FLAGS);
-        if (s->xkb_compose_table == NULL) {
+    bstate->xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_DEFAULT_INCLUDES);
+    if (bstate->xkb_ctx) {
+        bstate->xkb_compose_table = xkb_compose_table_new_from_locale(bstate->xkb_ctx, setlocale(LC_CTYPE, NULL), XKB_COMPOSE_COMPILE_NO_FLAGS);
+        if (bstate->xkb_compose_table == NULL) {
             LOG_WARNING("Failed to get xkb_compose_table");
         }
     } else {
         LOG_ERROR("Failed to create xkb_context");
     }
 
-    s->window_states = _window_states;
-
-    s->curr_state = state;
-    s->last_state = &s->state_buf_a;
-    s->next_state = &s->state_buf_b;
-    s->next_state->windows = next_windows;
-    s->last_state->windows = last_windows;
-    deep_copy_state(s->last_state, state);
-
-    s->next_state->events = events;
-    s->next_state->events_len = 0;
-    s->initialized = true;
+    bstate->curr_state = state;
+    bstate->last_state = calloc(1, sizeof(*bstate->last_state));
+    if (!bstate->last_state) {
+        LOG_FATAL("failed to allocate last_state");
+        return;
+    }
+    resize_windows(bstate, 16);
 }
 
 void pl_init(PLState* state, PLErrorCallback error_callback) {
     g_error_callback = error_callback;
     if (!state) { return; }
     memset(state, 0, sizeof(*state));
-    state->windows = windows;
-
-    state->events = events;
-    state->events_len = 0;
-    state->_internal = &_internal_state;
-    init_state_internal((StateInternal*)state->_internal, state);
-    state->wl_display = _internal_state.display;
+    state->_backend = calloc(1, sizeof(*state->_backend));
+    if (!state->_backend) {
+        LOG_FATAL("Failed to allocate backend state");
+        return;
+    }
+    init_backend_state(state->_backend, state);
+    resize_events(state, 128);
+    deep_copy_state(state->_backend->last_state, state);
 }
 
 static int poll_wayland_events(struct wl_display* display) {
@@ -1168,145 +1140,156 @@ static int poll_wayland_events(struct wl_display* display) {
     }
 }
 
-static WindowState* alloc_window_state(StateInternal* state) {
-    uint32_t cap = sizeof(_window_states) / sizeof(_window_states[0]);
-    WindowState* win;
-    if (!state->next_free_window) {
-        assert(state->window_states_len < cap);
-        win = &state->window_states[state->window_states_len++];
-        win->state = state;
-        return win;
+static PLBackendWindow* alloc_backend_window(PLBackendState* bstate) {
+    PLBackendWindow* bwin = calloc(1, sizeof(*bwin));
+    if (!bwin) {
+        LOG_FATAL("failed to allocate PLBackendWindow");
+        return NULL;
     }
-    win = state->next_free_window;
-    state->next_free_window = (WindowState*)win->state;
-    win->state = state;
-    return win;
+    return bwin;
 }
 
-static void free_window_state(WindowState* win_state) {
-    if (win_state == NULL) { return; }
-    StateInternal* state = win_state->state;
-    win_state->state = (StateInternal*)state->next_free_window;
-    state->next_free_window = win_state;
+static void free_backend_window(PLBackendWindow* bwin) {
+    if (bwin == NULL) { return; }
+    free(bwin);
 }
 
-static void destroy_window(WindowState* win_state) {
-    if (!win_state) { return; }
-    if (win_state->decor) {
-        zxdg_toplevel_decoration_v1_destroy(win_state->decor);
+static void destroy_backend_window(PLBackendWindow* bwin) {
+    if (!bwin) { return; }
+    if (bwin->decor) {
+        zxdg_toplevel_decoration_v1_destroy(bwin->decor);
     }
-    if (win_state->toplevel) {
-        xdg_toplevel_destroy(win_state->toplevel);
+    if (bwin->toplevel) {
+        xdg_toplevel_destroy(bwin->toplevel);
     }
-    if (win_state->xdg_surface) {
-        xdg_surface_destroy(win_state->xdg_surface);
+    if (bwin->xdg_surface) {
+        xdg_surface_destroy(bwin->xdg_surface);
     }
-    if (win_state->surface) {
-        wl_surface_destroy(win_state->surface);
+    if (bwin->surface) {
+        wl_surface_destroy(bwin->surface);
     }
-    free_window_state(win_state);
+    free_backend_window(bwin);
+}
+
+static void close_window(PLBackendState* bstate, uint32_t win) {
+    if (win < 0) { return; }
+    PLWindow* curr_win = &bstate->curr_state->windows[win];
+    PLWindow* last_win = &bstate->last_state->windows[win];
+    destroy_backend_window(bstate->curr_state->windows[win]._backend);
+    if (last_win->title) {
+        free(last_win->title);
+    }
+    memset(curr_win, 0, sizeof(*curr_win));
+    memset(last_win, 0, sizeof(*last_win));
+}
+
+void deinit_backend_state(PLBackendState* bstate) {
+    if (!bstate) { return; }
+
+    for (uint32_t id = 0; id < bstate->curr_state->windows_cap; id++) {
+        close_window(bstate, id);
+    }
+
+    if (bstate->xkb_state) {
+        xkb_state_unref(bstate->xkb_state);
+    }
+    if (bstate->xkb_keymap) {
+        xkb_keymap_unref(bstate->xkb_keymap);
+    }
+    if (bstate->xkb_ctx) {
+        xkb_context_unref(bstate->xkb_ctx);
+    }
+
+    if (bstate->keyboard) {
+        if (wl_proxy_get_version((void*)bstate->keyboard) >= 3) {
+            wl_keyboard_release(bstate->keyboard);
+        }
+    }
+    if (bstate->pointer) {
+        if (wl_proxy_get_version((void*)bstate->pointer) >= 3) {
+            wl_pointer_release(bstate->pointer);
+        }
+    }
+    if (bstate->seat) {
+        if (wl_proxy_get_version((void*)bstate->seat) >= 5) {
+            wl_seat_release(bstate->seat);
+        }
+    }
+    if (bstate->decor_manager) {
+        zxdg_decoration_manager_v1_destroy(bstate->decor_manager);
+    }
+    if (bstate->xdg_wm_base) {
+        xdg_wm_base_destroy(bstate->xdg_wm_base);
+    }
+    if (bstate->compositor) {
+        wl_compositor_destroy(bstate->compositor);
+    }
+    if (bstate->registry) {
+        wl_registry_destroy(bstate->registry);
+    }
+    if (bstate->display) {
+        wl_display_disconnect(bstate->display);
+    }
+    if (bstate->last_state) {
+        free(bstate->last_state);
+    }
+    resize_windows(bstate, 0);
+    free(bstate);
 }
 
 void pl_deinit(PLState* state) {
     if (!state) { return; }
-    StateInternal* s = state->_internal;
-
-    uint32_t windows_len = sizeof(windows) / sizeof(windows[0]);
-    for (uint32_t i = 0; i < windows_len; i++) {
-        if (state->windows[i].valid && state->windows[i]._internal) {
-            destroy_window(state->windows[i]._internal);
-        }
-    }
-
-    if (s->xkb_state) {
-        xkb_state_unref(s->xkb_state);
-    }
-    if (s->xkb_keymap) {
-        xkb_keymap_unref(s->xkb_keymap);
-    }
-    if (s->xkb_ctx) {
-        xkb_context_unref(s->xkb_ctx);
-    }
-
-    if (s->keyboard) {
-        if (wl_proxy_get_version((void*)s->keyboard) >= 3) {
-            wl_keyboard_release(s->keyboard);
-        }
-    }
-    if (s->pointer) {
-        if (wl_proxy_get_version((void*)s->pointer) >= 3) {
-            wl_pointer_release(s->pointer);
-        }
-    }
-    if (s->seat) {
-        if (wl_proxy_get_version((void*)s->seat) >= 5) {
-            wl_seat_release(s->seat);
-        }
-    }
-    if (s->decor_manager) {
-        zxdg_decoration_manager_v1_destroy(s->decor_manager);
-    }
-    if (s->xdg_wm_base) {
-        xdg_wm_base_destroy(s->xdg_wm_base);
-    }
-    if (s->compositor) {
-        wl_compositor_destroy(s->compositor);
-    }
-    if (s->registry) {
-        wl_registry_destroy(s->registry);
-    }
-    if (s->display) {
-        wl_display_disconnect(s->display);
-    }
-    return;
+    deinit_backend_state(state->_backend);
+    resize_events(state, 0);
+    memset(state, 0, sizeof(*state));
 }
 
-static WindowState* create_window(StateInternal* state_i) {
-    WindowState* win_state = alloc_window_state(state_i);
-    if (!win_state) {
+static PLBackendWindow* create_window(PLBackendState* bstate) {
+    PLBackendWindow* bwin = alloc_backend_window(bstate);
+    if (!bwin) {
         LOG_ERROR("failed to allocate new window state");
         goto error;
     }
+    bwin->bstate = bstate;
 
-    win_state->surface = wl_compositor_create_surface(state_i->compositor);
-    if (!win_state->surface) {
+    bwin->surface = wl_compositor_create_surface(bstate->compositor);
+    if (!bwin->surface) {
         LOG_ERROR("failed to create wl_surface");
         goto error;
     }
-    wl_surface_add_listener(win_state->surface, &wl_surface_listener, win_state);
+    wl_surface_add_listener(bwin->surface, &wl_surface_listener, bwin);
 
-    win_state->xdg_surface = xdg_wm_base_get_xdg_surface(state_i->xdg_wm_base, win_state->surface);
-    if (!win_state->xdg_surface) {
+    bwin->xdg_surface = xdg_wm_base_get_xdg_surface(bstate->xdg_wm_base, bwin->surface);
+    if (!bwin->xdg_surface) {
         LOG_ERROR("failed to create xdg_surface");
         goto error;
     }
-    xdg_surface_add_listener(win_state->xdg_surface, &xdg_surface_listener, win_state);
+    xdg_surface_add_listener(bwin->xdg_surface, &xdg_surface_listener, bwin);
 
-    win_state->toplevel = xdg_surface_get_toplevel(win_state->xdg_surface);
-    if (!win_state->toplevel) {
+    bwin->toplevel = xdg_surface_get_toplevel(bwin->xdg_surface);
+    if (!bwin->toplevel) {
         LOG_ERROR("failed to get xdg_toplevel");
         goto error;
     }
-    xdg_toplevel_add_listener(win_state->toplevel, &xdg_toplevel_listener, win_state);
+    xdg_toplevel_add_listener(bwin->toplevel, &xdg_toplevel_listener, bwin);
 
-    if (state_i->decor_manager) {
-        win_state->decor = zxdg_decoration_manager_v1_get_toplevel_decoration(
-                state_i->decor_manager, win_state->toplevel);
-        if (!win_state->decor) {
+    if (bstate->decor_manager) {
+        bwin->decor = zxdg_decoration_manager_v1_get_toplevel_decoration(
+                bstate->decor_manager, bwin->toplevel);
+        if (!bwin->decor) {
             LOG_ERROR("failed to get xdg_toplevel_decoration");
             goto error;
         }
-        zxdg_toplevel_decoration_v1_add_listener(win_state->decor,
-                &xdg_toplevel_decoration_listener, win_state);
-        zxdg_toplevel_decoration_v1_set_mode(win_state->decor,
+        zxdg_toplevel_decoration_v1_add_listener(bwin->decor,
+                &xdg_toplevel_decoration_listener, bwin);
+        zxdg_toplevel_decoration_v1_set_mode(bwin->decor,
                 ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
     }
-    wl_surface_commit(win_state->surface);
-
-    return win_state;
+    wl_surface_commit(bwin->surface);
+    return bwin;
 
 error:
-    destroy_window(win_state);
+    destroy_backend_window(bwin);
     return NULL;
 }
 
@@ -1318,89 +1301,93 @@ static char* null_to_empty(char* str) {
     }
 }
 
-void update_window(StateInternal* state, uint32_t id) {
-    PLWindow* last = &state->last_state->windows[id];
-    PLWindow* curr = &state->curr_state->windows[id];
-    PLWindow* next = &state->next_state->windows[id];
-    WindowState* win_state = next->_internal;
+void update_window(PLBackendState* bstate, uint32_t id) {
+    PLWindow* last = &bstate->last_state->windows[id];
+    PLWindow* curr = &bstate->curr_state->windows[id];
+    PLBackendWindow* bwin = curr->_backend;
     if (!curr->valid) {
         if (last->valid) {
-            destroy_window(curr->_internal);
-            memset(next, 0, sizeof(*next));
+            close_window(bstate, id);
         }
         return;
     }
     if (!last->valid) {
-        win_state = create_window(state);
-        win_state->window_id = id;
-        next->_internal = win_state;
-        next->wl_surface = win_state->surface;
-        if (next->_internal == NULL) {
-            memset(next, 0, sizeof(*next));
+        bwin = create_window(bstate);
+        if (!bwin) {
+            memset(curr, 0, sizeof(*curr));
+            return;
         }
+        bwin->window_id = id;
+        curr->_backend = bwin;
     }
-    if (win_state->toplevel) {
-        char* last_title = null_to_empty(last->title);
-        char* new_title = null_to_empty(curr->title);
-        if (strcmp(last_title, new_title) != 0) {
-            printf("differing titles\n");
-            xdg_toplevel_set_title(win_state->toplevel, new_title);
+    char* last_title = null_to_empty(last->title);
+    char* new_title = null_to_empty(curr->title);
+    if (strcmp(last_title, new_title) != 0) {
+        if (bwin->toplevel) {
+            xdg_toplevel_set_title(bwin->toplevel, new_title);
+        }
+        if (last->title) {
+            free(last->title);
+            last->title = NULL;
+        }
+        if (curr->title) {
+            size_t len = strlen(curr->title) + 1;
+            last->title = calloc(len, 1);
+            memcpy(last->title, curr->title, len);
         }
     }
 }
 
 void pl_update(PLState* state) {
-    StateInternal* state_i = state->_internal;
+    PLBackendState* bstate = state->_backend;
+    bstate->curr_state = state;
 
-    // cache changes to state
-    state_i->curr_state = state;
-    deep_copy_state(state_i->next_state, state);
+    // enact changes based on last -> curr state delta
+    uint32_t max_cap = state->windows_cap;
+    if (bstate->last_state->windows_cap > max_cap) {
+        max_cap = bstate->last_state->windows_cap;
+    }
+    for (uint32_t id = FIRST_WIN_ID; id < max_cap; id++) {
+        update_window(bstate, id);
+    }
 
+    // TODO separate this or smth
     // clear transients
-    state_i->next_state->events_len = 0;
+    bstate->curr_state->events_len = 0;
     for (uint32_t i = 0; i < PL_MB_COUNT; i++) {
-        PLButtonState* button = &state_i->next_state->mouse.buttons[i];
+        PLButtonState* button = &bstate->curr_state->mouse.buttons[i];
         button->just_pressed = false;
         button->just_released = false;
         button->repeat = false;
         button->extra_presses = 0;
     }
     for (uint32_t i = 0; i < PL_KEY_COUNT; i++) {
-        PLButtonState* button = &state_i->next_state->keyboard.keys[i];
+        PLButtonState* button = &bstate->curr_state->keyboard.keys[i];
         button->just_pressed = false;
         button->just_released = false;
         button->repeat = false;
         button->extra_presses = 0;
     }
 
-    // read events & update next_state (in callbacks)
-    poll_wayland_events(state_i->display);
+    // read events & update curr_state (in callbacks)
+    poll_wayland_events(bstate->display);
 
-    // enact changes based on last -> curr state delta
-    uint32_t len = sizeof(windows) / sizeof(windows[0]);
-    for (uint32_t id = FIRST_WIN_ID; id < len; id++) {
-        update_window(state_i, id);
-    }
-
-    // copy out new state
-    deep_copy_state(state, state_i->next_state);
-
-    // swap buffers
-    PLState* last_state = state_i->last_state;
-    state_i->last_state = state_i->next_state;
-    state_i->next_state = last_state;
+    // set last state to current state
+    deep_copy_state(bstate->last_state, bstate->curr_state);
 }
 
 static uint32_t next_free_window_id(PLState* state) {
-    uint32_t len = sizeof(windows) / sizeof(windows[0]);
-    for (uint32_t i = FIRST_WIN_ID; i < len; i++) {
-        if (!state->windows[i].valid) {
+    for (uint32_t i = FIRST_WIN_ID; i < state->windows_cap; i++) {
+        // _backend must be null to avoid returning a window that was closed
+        // (valid = false) but not yet freed in the next pl_update
+        if (!state->windows[i].valid && !state->windows[i]._backend) {
             PLWindow* win = &state->windows[i];
             memset(win, 0, sizeof(*win));
             return i;
         }
     }
-    return 0;
+    resize_windows(state->_backend, state->windows_cap * 2);
+    return state->windows_cap;
 }
 
 uint32_t pl_open_window(PLState* state) {
