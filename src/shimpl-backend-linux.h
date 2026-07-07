@@ -10,6 +10,7 @@
 #include <xdg-shell.h>
 #include <xdg-decoration.h>
 
+typedef uint32_t PLWinID;
 typedef struct PLBackendState PLBackendState;
 typedef struct PLBackendWindow PLBackendWindow;
 
@@ -19,7 +20,7 @@ struct PLBackendWindow {
     struct xdg_surface* xdg_surface;
     struct xdg_toplevel* toplevel;
     struct zxdg_toplevel_decoration_v1* decor;
-    uint32_t window_id;
+    PLWinID window_id;
 };
 
 #define SCROLL_AXIS_COUNT 2

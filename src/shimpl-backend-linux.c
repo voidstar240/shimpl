@@ -981,7 +981,7 @@ xdg_toplevel_decoration_listener = {
 
 static void deep_copy_state(PLState* dest, PLState* src) {
     if (dest->windows && src->windows) {
-        for (uint32_t i = 0; i < dest->windows_cap; i++) {
+        for (PLWinID i = 0; i < dest->windows_cap; i++) {
             char* title = dest->windows[i].title;
             memcpy(&dest->windows[i], &src->windows[i], sizeof(*src->windows));
             dest->windows[i].title = title;
@@ -1066,6 +1066,8 @@ static void init_backend_state(PLBackendState* bstate, PLState* state) {
     }
 
     bstate->curr_state = state;
+    // TODO last_state (and all child data) can be temp allocated since it is
+    // only read after the deep copy each update not written to
     bstate->last_state = calloc(1, sizeof(*bstate->last_state));
     if (!bstate->last_state) {
         LOG_FATAL("failed to allocate last_state");
@@ -1171,7 +1173,7 @@ static void destroy_backend_window(PLBackendWindow* bwin) {
     free_backend_window(bwin);
 }
 
-static void close_window(PLBackendState* bstate, uint32_t win) {
+static void close_window(PLBackendState* bstate, PLWinID win) {
     if (win < 0) { return; }
     PLWindow* curr_win = &bstate->curr_state->windows[win];
     PLWindow* last_win = &bstate->last_state->windows[win];
@@ -1186,7 +1188,7 @@ static void close_window(PLBackendState* bstate, uint32_t win) {
 void deinit_backend_state(PLBackendState* bstate) {
     if (!bstate) { return; }
 
-    for (uint32_t id = 0; id < bstate->curr_state->windows_cap; id++) {
+    for (PLWinID id = 0; id < bstate->curr_state->windows_cap; id++) {
         close_window(bstate, id);
     }
 
@@ -1301,7 +1303,7 @@ static char* null_to_empty(char* str) {
     }
 }
 
-void update_window(PLBackendState* bstate, uint32_t id) {
+void update_window(PLBackendState* bstate, PLWinID id) {
     PLWindow* last = &bstate->last_state->windows[id];
     PLWindow* curr = &bstate->curr_state->windows[id];
     PLBackendWindow* bwin = curr->_backend;
@@ -1347,7 +1349,7 @@ void pl_update(PLState* state) {
     if (bstate->last_state->windows_cap > max_cap) {
         max_cap = bstate->last_state->windows_cap;
     }
-    for (uint32_t id = FIRST_WIN_ID; id < max_cap; id++) {
+    for (PLWinID id = FIRST_WIN_ID; id < max_cap; id++) {
         update_window(bstate, id);
     }
 
@@ -1376,8 +1378,8 @@ void pl_update(PLState* state) {
     deep_copy_state(bstate->last_state, bstate->curr_state);
 }
 
-static uint32_t next_free_window_id(PLState* state) {
-    for (uint32_t i = FIRST_WIN_ID; i < state->windows_cap; i++) {
+static PLWinID next_free_window_id(PLState* state) {
+    for (PLWinID i = FIRST_WIN_ID; i < state->windows_cap; i++) {
         // _backend must be null to avoid returning a window that was closed
         // (valid = false) but not yet freed in the next pl_update
         if (!state->windows[i].valid && !state->windows[i]._backend) {
@@ -1386,12 +1388,13 @@ static uint32_t next_free_window_id(PLState* state) {
             return i;
         }
     }
+    PLWinID old_cap = state->windows_cap;
     resize_windows(state->_backend, state->windows_cap * 2);
-    return state->windows_cap;
+    return old_cap;
 }
 
-uint32_t pl_open_window(PLState* state) {
-    uint32_t id = next_free_window_id(state);
+PLWinID pl_open_window(PLState* state) {
+    PLWinID id = next_free_window_id(state);
     PLWindow* win = &state->windows[id];
     win->valid = true;
     return id;

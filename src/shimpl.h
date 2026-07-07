@@ -4,7 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define NULL_WINDOW 0
+typedef uint32_t PLWinID;
+#define NULL_WINDOW ((PLWinID)0)
 
 typedef enum PLMouseButton {
     PL_MB_LEFT,
@@ -238,7 +239,7 @@ typedef struct PLEventTextInput {
 
 typedef struct PLEvent {
     PLEventType type;
-    uint32_t window;
+    PLWinID window;
     union {
         PLEventMotion motion;
         PLEventScroll scroll;
@@ -283,12 +284,12 @@ typedef struct PLMouse {
     bool scroll_inverted_v : 1;
     bool scroll_inverted_h : 1;
     PLButtonState buttons[PL_MB_COUNT];
-    uint32_t focus_window;
+    PLWinID focus_window;
 } PLMouse;
 
 typedef struct PLKeyboard {
     PLButtonState keys[PL_KEY_COUNT];
-    uint32_t focus_window;
+    PLWinID focus_window;
 } PLKeyboard;
 
 typedef struct PLState {
@@ -318,6 +319,6 @@ void pl_init(PLState* state, PLErrorCallback error_callback);
 void pl_update(PLState* state);
 void pl_deinit(PLState* state);
 
-uint32_t pl_open_window(PLState* state);
+PLWinID pl_open_window(PLState* state);
 
 #endif /* SHIMPL_H */
