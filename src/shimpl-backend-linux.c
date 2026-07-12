@@ -16,10 +16,7 @@
 // REMOVE IF ADDING TABLET INTERFACE
 const struct wl_interface zwp_tablet_tool_v2_interface = {0};
 
-// TODO typedef window handle/id type
-// TODO Should NULL_WIN_ID be -1 to avoid wasted space in windows array? but
-// this breaks ZII
-#define FIRST_WIN_ID 1
+#define FIRST_WIN_ID ((PLWinID)1)
 
 static PLErrorCallback g_error_callback = NULL;
 static char g_error_msg_buf[1024] = {0};
@@ -43,34 +40,86 @@ static void log_error(uint8_t severity, const char* file, uint32_t line) {
     }
 }
 
-static void resize_events(PLState* state, uint32_t new_cap) {
-    PLEvent* new_events = NULL;
-    if (new_cap == 0) {
-        if (state->events) {
-            free(state->events);
-            state->events_cap = 0;
+static void* g_tmp_first_page = NULL;
+static void* g_tmp_curr_page = NULL;
+static size_t g_tmp_page_cap = 0;
+static size_t g_tmp_page_size = 4096;
+static size_t max_align = sizeof(void*);
+
+static void* tmp_next_page() {
+    void* next_page = NULL;
+    if (!g_tmp_curr_page || !(*(void**)g_tmp_curr_page)) {
+        // TODO allocate pages from OS directly with mmap
+        next_page = calloc(1, g_tmp_page_size);
+        if (!next_page) {
+            return NULL;
         }
-        return;
+        // first 8 bytes of page stores pointer to next page
+        *(void**)next_page = NULL;
+        if (g_tmp_curr_page) {
+            *(void**)g_tmp_curr_page = next_page;
+        }
+    } else {
+        next_page = *(void**)g_tmp_curr_page;
     }
-    new_events = calloc(new_cap, sizeof(*new_events));
-    if (!new_events) {
-        LOG_FATAL("Failed to allocate events array");
-        return;
+    g_tmp_curr_page = next_page;
+    if (!g_tmp_first_page) {
+        g_tmp_first_page = g_tmp_curr_page;
     }
-    memset(new_events, 0, sizeof(*state->events) * new_cap);
-    if (state->events) {
-        memcpy(new_events, state->events, sizeof(*state->events) * state->events_len);
-        free(state->events);
+    g_tmp_page_cap = sizeof(void*);
+    return next_page;
+}
+
+// TODO alignment arg?
+static void* tmp_alloc(size_t size) {
+    if (size > (g_tmp_page_size - sizeof(void*))) {
+        // TODO allocate N consecutive pages
+        return NULL;
     }
-    state->events = new_events;
-    state->events_cap = new_cap;
+
+    if (!g_tmp_curr_page || ((g_tmp_page_cap + size) >= g_tmp_page_size)) {
+        if (!tmp_next_page()) {
+            return NULL;
+        }
+    }
+    // round up to next alignment
+    g_tmp_page_cap += max_align - 1;
+    g_tmp_page_cap /= max_align;
+    g_tmp_page_cap *= max_align;
+    void* out_ptr = g_tmp_curr_page + g_tmp_page_cap;
+    g_tmp_page_cap += size;
+    return out_ptr;
+}
+
+static void tmp_reset(void) {
+    g_tmp_curr_page = g_tmp_first_page;
+    g_tmp_page_cap = 8;
+}
+
+static void tmp_free_pages(void) {
+    while (g_tmp_first_page) {
+        void* next = *(void**)g_tmp_first_page;
+        free(g_tmp_first_page);
+        g_tmp_first_page = next;
+    }
+    g_tmp_curr_page = NULL;
+    g_tmp_page_cap = 0;
 }
 
 static void push_event(PLBackendState* bstate, PLEvent ev) {
-    if (bstate->curr_state->events_len >= bstate->curr_state->events_cap) {
-        resize_events(bstate->curr_state, bstate->curr_state->events_cap * 2);
+    static PLEvent* last_event;
+    PLEvent* ev_alloc = tmp_alloc(sizeof(ev));
+    if (!ev_alloc) {
+        LOG_FATAL("Failed to allocate event");
+        return;
     }
-    bstate->curr_state->events[bstate->curr_state->events_len++] = ev;
+    *ev_alloc = ev;
+    if (!bstate->curr_state->first_event) {
+        bstate->curr_state->first_event = ev_alloc;
+    } else {
+        last_event->next = ev_alloc;
+    }
+    last_event = ev_alloc;
 }
 
 static void press_button(PLButtonState* button) {
@@ -345,7 +394,7 @@ static struct xdg_wm_base_listener xdg_wm_base_listener = {
 // END XDG_WM_BASE LISTENER
 
 // BEGIN WL_POINTER LISTENER
-void wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
+static void wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
         uint32_t serial, struct wl_surface *surface, wl_fixed_t surface_x,
         wl_fixed_t surface_y) {
     PLBackendState* bstate = data;
@@ -365,7 +414,7 @@ void wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
     }
 }
 
-void wl_pointer_leave(void *data, struct wl_pointer *wl_pointer,
+static void wl_pointer_leave(void *data, struct wl_pointer *wl_pointer,
         uint32_t serial, struct wl_surface *surface) {
     PLBackendState* bstate = data;
     bstate->pointer_serial = serial;
@@ -381,7 +430,7 @@ void wl_pointer_leave(void *data, struct wl_pointer *wl_pointer,
     }
 }
 
-void wl_pointer_motion(void *data, struct wl_pointer *wl_pointer, uint32_t time,
+static void wl_pointer_motion(void *data, struct wl_pointer *wl_pointer, uint32_t time,
         wl_fixed_t surface_x, wl_fixed_t surface_y) {
     PLBackendState* bstate = data;
     bstate->curr_state->mouse.pos_x = wl_fixed_to_double(surface_x);
@@ -397,7 +446,7 @@ void wl_pointer_motion(void *data, struct wl_pointer *wl_pointer, uint32_t time,
     push_event(bstate, ev);
 }
 
-void wl_pointer_button(void *data, struct wl_pointer *wl_pointer,
+static void wl_pointer_button(void *data, struct wl_pointer *wl_pointer,
         uint32_t serial, uint32_t time, uint32_t button, uint32_t but_state) {
     PLBackendState* bstate = data;
     bstate->pointer_serial = serial;
@@ -514,7 +563,7 @@ static void send_pointer_events(PLBackendState* bstate) {
     memset(events, 0, sizeof(*events));
 }
 
-void wl_pointer_axis(void *data, struct wl_pointer *wl_pointer, uint32_t time,
+static void wl_pointer_axis(void *data, struct wl_pointer *wl_pointer, uint32_t time,
         uint32_t axis, wl_fixed_t value) {
     PLBackendState* bstate = data;
     bstate->pointer_ev_group.scroll[axis] += wl_fixed_to_double(value);
@@ -525,13 +574,13 @@ void wl_pointer_axis(void *data, struct wl_pointer *wl_pointer, uint32_t time,
 }
 
 // since 5
-void wl_pointer_frame(void *data, struct wl_pointer *wl_pointer) {
+static void wl_pointer_frame(void *data, struct wl_pointer *wl_pointer) {
     PLBackendState* bstate = data;
     send_pointer_events(bstate);
 }
 
 // since 5
-void wl_pointer_axis_source(void *data, struct wl_pointer *wl_pointer,
+static void wl_pointer_axis_source(void *data, struct wl_pointer *wl_pointer,
         uint32_t axis_source) {
     // what "device" generated the axis event (wheel, finger, etc.)
     PLBackendState* bstate = data;
@@ -539,7 +588,7 @@ void wl_pointer_axis_source(void *data, struct wl_pointer *wl_pointer,
 }
 
 // since 5
-void wl_pointer_axis_stop(void *data, struct wl_pointer *wl_pointer,
+static void wl_pointer_axis_stop(void *data, struct wl_pointer *wl_pointer,
         uint32_t time, uint32_t axis) {
     // called when user lifts finger stopping a scroll event
     PLBackendState* bstate = data;
@@ -547,7 +596,7 @@ void wl_pointer_axis_stop(void *data, struct wl_pointer *wl_pointer,
 }
 
 // since 5 deprecated since 8
-void wl_pointer_axis_discrete(void *data, struct wl_pointer *wl_pointer,
+static void wl_pointer_axis_discrete(void *data, struct wl_pointer *wl_pointer,
         uint32_t axis, int32_t discrete) {
     // called every "click" of the scroll wheel
     PLBackendState* bstate = data;
@@ -556,7 +605,7 @@ void wl_pointer_axis_discrete(void *data, struct wl_pointer *wl_pointer,
 }
 
 // since 8
-void wl_pointer_axis_value120(void *data, struct wl_pointer *wl_pointer,
+static void wl_pointer_axis_value120(void *data, struct wl_pointer *wl_pointer,
         uint32_t axis, int32_t value120) {
     // replaces axis_discrete. every 120 is one click of wheel
     PLBackendState* bstate = data;
@@ -564,7 +613,7 @@ void wl_pointer_axis_value120(void *data, struct wl_pointer *wl_pointer,
 }
 
 // since 9
-void wl_pointer_axis_relative_direction(void *data,
+static void wl_pointer_axis_relative_direction(void *data,
         struct wl_pointer *wl_pointer, uint32_t axis, uint32_t direction) {
     // reports whether the users action (scroll, swipe, etc.) is in the same
     // direction as the scroll (reverse/natural scrolling)
@@ -724,33 +773,31 @@ static void wl_keyboard_key(void *data, struct wl_keyboard *wl_keyboard,
     }
     push_event(bstate, ev);
 
+    xkb_keycode_t xkb_key = key + 8;
     const xkb_keysym_t* syms;
-    int syms_len = xkb_state_key_get_syms(bstate->xkb_state, key + 8, &syms);
+    int syms_len = xkb_state_key_get_syms(bstate->xkb_state, xkb_key, &syms);
     uint32_t utf8_len = 0;
     char* utf8_buf = NULL;
+    enum xkb_compose_status status = XKB_COMPOSE_NOTHING;
     if (bstate->xkb_compose_state) {
-        for (int i = 0; i < syms_len; i++) {
-            xkb_compose_state_feed(bstate->xkb_compose_state, syms[i]);
-        }
-        switch (xkb_compose_state_get_status(bstate->xkb_compose_state)) {
-            case XKB_COMPOSE_NOTHING:
-                utf8_len = xkb_state_key_get_utf8(bstate->xkb_state, key + 8, NULL, 0) + 1;
-                utf8_buf = malloc(utf8_len);
-                xkb_state_key_get_utf8(bstate->xkb_state, key + 8, utf8_buf, utf8_len);
-                break;
-            case XKB_COMPOSE_COMPOSED:
-                utf8_len = xkb_compose_state_get_utf8(bstate->xkb_compose_state, NULL, 0) + 1;
-                utf8_buf =  malloc(utf8_len);
-                utf8_len = xkb_compose_state_get_utf8(bstate->xkb_compose_state, utf8_buf, utf8_len);
-                break;
-            case XKB_COMPOSE_COMPOSING:
-            case XKB_COMPOSE_CANCELLED:
-                break;
-        }
-    } else {
-        utf8_len = xkb_state_key_get_utf8(bstate->xkb_state, key + 8, NULL, 0) + 1;
-        utf8_buf = malloc(utf8_len);
-        xkb_state_key_get_utf8(bstate->xkb_state, key + 8, utf8_buf, utf8_len);
+        xkb_keysym_t sym = (syms_len > 1) ? XKB_KEY_NoSymbol : syms[0];
+        xkb_compose_state_feed(bstate->xkb_compose_state, sym);
+        status = xkb_compose_state_get_status(bstate->xkb_compose_state);
+    }
+    switch (status) {
+        case XKB_COMPOSE_NOTHING:
+            utf8_len = xkb_state_key_get_utf8(bstate->xkb_state, xkb_key, NULL, 0);
+            utf8_buf = tmp_alloc(utf8_len + 1);
+            xkb_state_key_get_utf8(bstate->xkb_state, xkb_key, utf8_buf, utf8_len + 1);
+            break;
+        case XKB_COMPOSE_COMPOSED:
+            utf8_len = xkb_compose_state_get_utf8(bstate->xkb_compose_state, NULL, 0);
+            utf8_buf =  tmp_alloc(utf8_len + 1);
+            xkb_compose_state_get_utf8(bstate->xkb_compose_state, utf8_buf, utf8_len + 1);
+            break;
+        case XKB_COMPOSE_COMPOSING:
+        case XKB_COMPOSE_CANCELLED:
+            break;
     }
     utf8_len = clean_utf8_string(utf8_buf, utf8_len);
     if (utf8_len > 0) {
@@ -761,7 +808,6 @@ static void wl_keyboard_key(void *data, struct wl_keyboard *wl_keyboard,
         text_ev.text.text_len = utf8_len;
         push_event(bstate, text_ev);
     }
-    // TODO utf8_buf gets leaked. make temp alloc or something
 }
 
 static void wl_keyboard_modifiers(void *data, struct wl_keyboard *wl_keyboard,
@@ -979,47 +1025,43 @@ xdg_toplevel_decoration_listener = {
 
 // END WAYLAND LISTENERS
 
-static void deep_copy_state(PLState* dest, PLState* src) {
-    if (dest->windows && src->windows) {
-        for (PLWinID i = 0; i < dest->windows_cap; i++) {
-            char* title = dest->windows[i].title;
-            memcpy(&dest->windows[i], &src->windows[i], sizeof(*src->windows));
-            dest->windows[i].title = title;
-        }
+
+static PLState* cache_state(PLState* state) {
+    PLState* cstate = tmp_alloc(sizeof(*state));
+    memcpy(cstate, state, sizeof(*state));
+    size_t wins_bytes = sizeof(*state->windows) * state->windows_cap;
+    cstate->windows = tmp_alloc(wins_bytes);
+    memcpy(cstate->windows, state->windows, wins_bytes);
+    for (PLWinID i = 0; i < state->windows_cap; i++) {
+        if (!state->windows[i].valid) { continue; }
+        if (!state->windows[i].title) { continue; }
+        size_t title_len = strlen(state->windows[i].title) + 1;
+        cstate->windows[i].title = tmp_alloc(title_len);
+        memcpy(cstate->windows[i].title, state->windows[i].title, title_len);
     }
-    PLWindow* windows = dest->windows;
-    memcpy(dest, src, sizeof(*dest));
-    dest->windows = windows;
+    state->_backend->last_state = cstate;
+    return cstate;
 }
 
-static void resize_windows(PLBackendState* bstate, uint32_t new_cap) {
-    PLWindow* curr_wins = bstate->curr_state->windows;
-    PLWindow* last_wins = bstate->last_state->windows;
-    PLWindow* new_curr_wins = NULL;
-    PLWindow* new_last_wins = NULL;
-    uint32_t curr_cap = bstate->curr_state->windows_cap;
-    uint32_t curr_bytes = sizeof(*curr_wins) * curr_cap;
+static void resize_windows(PLState* state, uint32_t new_cap) {
+    if (new_cap == state->windows_cap) { return; }
+    PLWindow* new_wins = NULL;
     if (new_cap > 0) {
-        new_curr_wins = calloc(new_cap * 2, sizeof(*curr_wins));
-        if (!new_curr_wins) {
-            LOG_FATAL("Failed to allocate windows array");
+        new_wins = realloc(state->windows, new_cap * sizeof(*state->windows));
+        if (!new_wins) {
+            LOG_FATAL("failed to reallocate windows array");
             return;
         }
-        new_last_wins = new_curr_wins + new_cap;
-        if (last_wins) {
-            memcpy(new_last_wins, last_wins, curr_bytes);
+        if (new_cap > state->windows_cap) {
+            PLWindow* uninit_wins = new_wins + state->windows_cap;
+            size_t uninit_cap = new_cap - state->windows_cap;
+            memset(uninit_wins, 0, uninit_cap * sizeof(*state->windows));
         }
-        if (curr_wins) {
-            memcpy(new_curr_wins, curr_wins, curr_bytes);
-        }
+    } else {
+        free(state->windows);
     }
-    if (curr_wins) {
-        free(curr_wins);
-    }
-    bstate->curr_state->windows = new_curr_wins;
-    bstate->last_state->windows = new_last_wins;
-    bstate->curr_state->windows_cap = new_cap;
-    bstate->last_state->windows_cap = new_cap;
+    state->windows = new_wins;
+    state->windows_cap = new_cap;
 }
 
 static void init_backend_state(PLBackendState* bstate, PLState* state) {
@@ -1066,14 +1108,6 @@ static void init_backend_state(PLBackendState* bstate, PLState* state) {
     }
 
     bstate->curr_state = state;
-    // TODO last_state (and all child data) can be temp allocated since it is
-    // only read after the deep copy each update not written to
-    bstate->last_state = calloc(1, sizeof(*bstate->last_state));
-    if (!bstate->last_state) {
-        LOG_FATAL("failed to allocate last_state");
-        return;
-    }
-    resize_windows(bstate, 16);
 }
 
 void pl_init(PLState* state, PLErrorCallback error_callback) {
@@ -1086,8 +1120,9 @@ void pl_init(PLState* state, PLErrorCallback error_callback) {
         return;
     }
     init_backend_state(state->_backend, state);
-    resize_events(state, 128);
-    deep_copy_state(state->_backend->last_state, state);
+    resize_windows(state, 16);
+    tmp_reset();
+    cache_state(state);
 }
 
 static int poll_wayland_events(struct wl_display* display) {
@@ -1151,11 +1186,6 @@ static PLBackendWindow* alloc_backend_window(PLBackendState* bstate) {
     return bwin;
 }
 
-static void free_backend_window(PLBackendWindow* bwin) {
-    if (bwin == NULL) { return; }
-    free(bwin);
-}
-
 static void destroy_backend_window(PLBackendWindow* bwin) {
     if (!bwin) { return; }
     if (bwin->decor) {
@@ -1170,26 +1200,19 @@ static void destroy_backend_window(PLBackendWindow* bwin) {
     if (bwin->surface) {
         wl_surface_destroy(bwin->surface);
     }
-    free_backend_window(bwin);
+    free(bwin);
 }
 
-static void close_window(PLBackendState* bstate, PLWinID win) {
-    if (win < 0) { return; }
-    PLWindow* curr_win = &bstate->curr_state->windows[win];
-    PLWindow* last_win = &bstate->last_state->windows[win];
-    destroy_backend_window(bstate->curr_state->windows[win]._backend);
-    if (last_win->title) {
-        free(last_win->title);
-    }
-    memset(curr_win, 0, sizeof(*curr_win));
-    memset(last_win, 0, sizeof(*last_win));
-}
-
-void deinit_backend_state(PLBackendState* bstate) {
+static void deinit_backend_state(PLBackendState* bstate) {
     if (!bstate) { return; }
 
-    for (PLWinID id = 0; id < bstate->curr_state->windows_cap; id++) {
-        close_window(bstate, id);
+    if (bstate->last_state) {
+        for (PLWinID id = 0; id < bstate->last_state->windows_cap; id++) {
+            PLWindow* win = &bstate->last_state->windows[id];
+            if (win->valid) {
+                destroy_backend_window(win->_backend);
+            }
+        }
     }
 
     if (bstate->xkb_state) {
@@ -1232,17 +1255,14 @@ void deinit_backend_state(PLBackendState* bstate) {
     if (bstate->display) {
         wl_display_disconnect(bstate->display);
     }
-    if (bstate->last_state) {
-        free(bstate->last_state);
-    }
-    resize_windows(bstate, 0);
+    tmp_free_pages();
     free(bstate);
 }
 
 void pl_deinit(PLState* state) {
     if (!state) { return; }
     deinit_backend_state(state->_backend);
-    resize_events(state, 0);
+    resize_windows(state, 0);
     memset(state, 0, sizeof(*state));
 }
 
@@ -1303,13 +1323,21 @@ static char* null_to_empty(char* str) {
     }
 }
 
-void update_window(PLBackendState* bstate, PLWinID id) {
-    PLWindow* last = &bstate->last_state->windows[id];
-    PLWindow* curr = &bstate->curr_state->windows[id];
+// TODO i feel like this can be cleaned up
+static void update_window(PLBackendState* bstate, PLWinID id) {
+    PLWindow* last = &bstate->last_state->windows[NULL_WINDOW];
+    PLWindow* curr = &bstate->curr_state->windows[NULL_WINDOW];
+    if (id < bstate->last_state->windows_cap) {
+        last = &bstate->last_state->windows[id];
+    }
+    if (id < bstate->curr_state->windows_cap) {
+        curr = &bstate->curr_state->windows[id];
+    }
     PLBackendWindow* bwin = curr->_backend;
     if (!curr->valid) {
         if (last->valid) {
-            close_window(bstate, id);
+            destroy_backend_window(last->_backend);
+            memset(curr, 0, sizeof(*curr));
         }
         return;
     }
@@ -1328,21 +1356,15 @@ void update_window(PLBackendState* bstate, PLWinID id) {
         if (bwin->toplevel) {
             xdg_toplevel_set_title(bwin->toplevel, new_title);
         }
-        if (last->title) {
-            free(last->title);
-            last->title = NULL;
-        }
-        if (curr->title) {
-            size_t len = strlen(curr->title) + 1;
-            last->title = calloc(len, 1);
-            memcpy(last->title, curr->title, len);
-        }
     }
 }
 
 void pl_update(PLState* state) {
     PLBackendState* bstate = state->_backend;
     bstate->curr_state = state;
+
+    // windows[0] must be 0 filled
+    memset(&state->windows[NULL_WINDOW], 0, sizeof(*state->windows));
 
     // enact changes based on last -> curr state delta
     uint32_t max_cap = state->windows_cap;
@@ -1355,7 +1377,7 @@ void pl_update(PLState* state) {
 
     // TODO separate this or smth
     // clear transients
-    bstate->curr_state->events_len = 0;
+    bstate->curr_state->first_event = NULL;
     for (uint32_t i = 0; i < PL_MB_COUNT; i++) {
         PLButtonState* button = &bstate->curr_state->mouse.buttons[i];
         button->just_pressed = false;
@@ -1370,12 +1392,13 @@ void pl_update(PLState* state) {
         button->repeat = false;
         button->extra_presses = 0;
     }
+    tmp_reset();
 
     // read events & update curr_state (in callbacks)
     poll_wayland_events(bstate->display);
 
-    // set last state to current state
-    deep_copy_state(bstate->last_state, bstate->curr_state);
+    // cache states to compare deltas next update
+    cache_state(state);
 }
 
 static PLWinID next_free_window_id(PLState* state) {
@@ -1389,7 +1412,7 @@ static PLWinID next_free_window_id(PLState* state) {
         }
     }
     PLWinID old_cap = state->windows_cap;
-    resize_windows(state->_backend, state->windows_cap * 2);
+    resize_windows(state, state->windows_cap * 2);
     return old_cap;
 }
 

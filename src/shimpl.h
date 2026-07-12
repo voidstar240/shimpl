@@ -240,6 +240,7 @@ typedef struct PLEventTextInput {
 typedef struct PLEvent {
     PLEventType type;
     PLWinID window;
+    struct PLEvent* next;
     union {
         PLEventMotion motion;
         PLEventScroll scroll;
@@ -298,9 +299,7 @@ typedef struct PLState {
     PLWindow* windows;
     uint32_t windows_cap;
 
-    PLEvent* events;
-    uint32_t events_len;
-    uint32_t events_cap;
+    PLEvent* first_event;
 
     // TODO multiple input devices?
 

@@ -25,6 +25,8 @@ uint32_t text_len = 0;
 
 bool input_mode = false;
 
+EGLConfig* configs;
+
 void err_cb(uint8_t sev, const char* msg, const char* file, uint32_t line) {
     const char* sev_str[] = { "WARNING", "ERROR", "FATAL"};
     fprintf(stderr, "[%s]: %s:%d: %s\n", sev_str[sev], file, line, msg);
@@ -47,23 +49,24 @@ int main(int argc, char* argv[]) {
     while (1) {
         pl_update(&state);
 
-        for (int i = 0; i < state.events_len; i++) {
-            if (state.events[i].type == PL_EV_MOUSE_MOTION) {
+        PLEvent* event = state.first_event;
+        for (; event; event = event->next) {
+            if (event->type == PL_EV_MOUSE_MOTION) {
                 continue;
             }
-            //printf("EV: %d, win %d\n", state.events[i].type, state.events[i].window);
-            if (state.events[i].type == PL_EV_TEXT_INPUT && input_mode) {
-                if (state.events[i].text.text[0] == '\b') {
+            //printf("EV: %d, win %d\n", event->type, event->window);
+            if (event->type == PL_EV_TEXT_INPUT && input_mode) {
+                if (event->text.text[0] == '\b') {
                     if (text_len > 0) {
                         text_len--;
                         text[text_len] = '\0';
                     }
-                } else if (state.events[i].text.text[0] == '\n') {
+                } else if (event->text.text[0] == '\n') {
                     printf("Exiting input mode...\n");
                 } else {
-                    memcpy(text + text_len, state.events[i].text.text, state.events[i].text.text_len);
-                    text_len += state.events[i].text.text_len;
-                    //printf("char: %d\n", state.events[i].text.text[0]);
+                    memcpy(text + text_len, event->text.text, event->text.text_len);
+                    text_len += event->text.text_len;
+                    //printf("char: %d\n", event->text.text[0]);
                 }
                 printf("Text Buffer: %.*s\n", text_len, text);
             }
@@ -123,6 +126,13 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    free(configs);
+    eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroySurface(egl_display, egl_surface);
+    eglDestroyContext(egl_display, egl_context);
+    eglTerminate(egl_display);
+    wl_egl_window_destroy(egl_window);
+
     pl_deinit(&state);
     return 0;
 }
@@ -152,7 +162,6 @@ void init_egl(struct wl_display* display, struct wl_surface* surface) {
     eglGetConfigs(egl_display, NULL, 0, &count);
     printf("Got %d egl configs\n", count);
 
-    EGLConfig* configs;
     configs = calloc(count, sizeof(*configs));
     EGLint n;
     EGLint config_attribs[] = {

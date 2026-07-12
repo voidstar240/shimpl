@@ -1,7 +1,7 @@
 .PHONY = all clean
 
 CC ?= gcc
-CFLAGS ?= -Wall -std=c99 -fPIC -fPIE -g -rdynamic -O0
+CFLAGS ?= -Wall -std=c99 -fPIC -fPIE -g -rdynamic -O0 -fsanitize=address
 
 INCLUDES := -Ithirdparty/libffi-3.5.2/include \
 			-Ithirdparty/wayland-libs-1.24.0/include \
