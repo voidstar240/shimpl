@@ -32,6 +32,15 @@ typedef struct {
     uint8_t scroll_dir[SCROLL_AXIS_COUNT];
 } WlPointerEventGroup;
 
+typedef struct PLArenaAlloc {
+    struct ArenaPageHeader* first_page;
+    struct ArenaPageHeader* curr_page;
+    size_t page_usage;
+    size_t default_page_size;
+    size_t align;
+    size_t page_count;
+} PLArenaAlloc;
+
 struct PLBackendState {
     // wayland state
     struct wl_display* display;
@@ -59,6 +68,9 @@ struct PLBackendState {
     struct xkb_compose_state* xkb_compose_state;
 
     // extra
+    PLArenaAlloc frame_alloc;
+    PLArenaAlloc bwin_alloc;
+    PLBackendWindow* bwin_free_list;
 
     struct PLState* last_state; // last state sent to user
     struct PLState* curr_state; // current state containing user changes
