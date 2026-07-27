@@ -18,25 +18,29 @@ const struct wl_interface zwp_tablet_tool_v2_interface = {0};
 
 #define FIRST_WIN_ID ((PLWinID)1)
 
-static PLErrorCallback g_error_callback = NULL;
-static char g_error_msg_buf[1024] = {0};
+static PLLogCallback g_log_callback = NULL;
+static char g_log_msg_buf[1024] = {0};
 
-#define LOG_WARNING(...) do { \
-    snprintf(g_error_msg_buf, sizeof(g_error_msg_buf), __VA_ARGS__); \
-    log_error(PL_WARNING, __FILE__, __LINE__); \
+#define LOG_INFO(...) do { \
+    snprintf(g_log_msg_buf, sizeof(g_log_msg_buf), __VA_ARGS__); \
+    log_msg(PL_INFO, __FILE__, __LINE__); \
+} while (0)
+#define LOG_WARN(...) do { \
+    snprintf(g_log_msg_buf, sizeof(g_log_msg_buf), __VA_ARGS__); \
+    log_msg(PL_WARN, __FILE__, __LINE__); \
 } while (0)
 #define LOG_ERROR(...) do { \
-    snprintf(g_error_msg_buf, sizeof(g_error_msg_buf), __VA_ARGS__); \
-    log_error(PL_ERROR, __FILE__, __LINE__); \
+    snprintf(g_log_msg_buf, sizeof(g_log_msg_buf), __VA_ARGS__); \
+    log_msg(PL_ERROR, __FILE__, __LINE__); \
 } while (0)
 #define LOG_FATAL(...) do { \
-    snprintf(g_error_msg_buf, sizeof(g_error_msg_buf), __VA_ARGS__); \
-    log_error(PL_FATAL, __FILE__, __LINE__); \
+    snprintf(g_log_msg_buf, sizeof(g_log_msg_buf), __VA_ARGS__); \
+    log_msg(PL_FATAL, __FILE__, __LINE__); \
 } while (0)
 
-static void log_error(uint8_t severity, const char* file, uint32_t line) {
-    if (g_error_callback) {
-        g_error_callback(severity, g_error_msg_buf, file, line);
+static void log_msg(PLLogLevel level, const char* file, uint32_t line) {
+    if (g_log_callback) {
+        g_log_callback(level, g_log_msg_buf, file, line);
     }
 }
 
@@ -93,14 +97,14 @@ static void* arena_next_page(PLArenaAlloc* arena, size_t min_size) {
     return new_page;
 }
 
-static void arena_init(PLArenaAlloc* arena, size_t n_pages, size_t page_size) {
+static void* arena_init(PLArenaAlloc* arena, size_t n_pages, size_t page_size) {
     arena->first_page = NULL;
     arena->curr_page = NULL;
     arena->default_page_size = page_size;
     arena->page_usage = 0;
     arena->align = sizeof(void*);
     arena->page_count = 0;
-    arena_next_page(arena, n_pages * arena->default_page_size);
+    return arena_next_page(arena, n_pages * arena->default_page_size);
 }
 
 static void* arena_alloc(PLArenaAlloc* arena, size_t size) {
@@ -138,9 +142,9 @@ static void arena_free_pages(PLArenaAlloc* arena) {
     arena->page_count = 0;
 };
 
-static void arena_defrag_pages(PLArenaAlloc* arena) {
+static void* arena_defrag_pages(PLArenaAlloc* arena) {
     if (arena->page_count <= 1) {
-        return;
+        return arena->first_page;
     }
     ArenaPageHeader* page = arena->first_page;
     size_t total_size = 0;
@@ -155,6 +159,18 @@ static void arena_defrag_pages(PLArenaAlloc* arena) {
     arena->first_page = calloc(1, total_size);
     arena->curr_page = arena->first_page;
     arena->page_usage = sizeof(ArenaPageHeader);
+    return arena->first_page;
+}
+
+static uint32_t g_pl_errno = PL_ERR_NONE;
+
+static void set_error(PLError error) {
+    assert(error != PL_ERR_NONE);
+    g_pl_errno = error;
+}
+
+uint32_t pl_last_error() {
+    return g_pl_errno;
 }
 
 static void push_event(PLBackendState* bstate, PLEvent ev) {
@@ -165,8 +181,8 @@ static void push_event(PLBackendState* bstate, PLEvent ev) {
         return;
     }
     *ev_alloc = ev;
-    if (!bstate->curr_state->first_event) {
-        bstate->curr_state->first_event = ev_alloc;
+    if (!bstate->curr_state->event_list) {
+        bstate->curr_state->event_list = ev_alloc;
     } else {
         last_event->next = ev_alloc;
     }
@@ -421,7 +437,7 @@ static void wl_registry_global(void* data, struct wl_registry* registry,
 
 static void wl_registry_global_remove(void* data, struct wl_registry* registry,
         uint32_t name) {
-    LOG_WARNING("wl_registry removed global object %d\n", name);
+    LOG_WARN("wl_registry removed global object %d\n", name);
 }
 
 static struct wl_registry_listener wl_registry_listener = {
@@ -503,7 +519,7 @@ static void wl_pointer_button(void *data, struct wl_pointer *wl_pointer,
 
     PLMouseButton mb = evcode2mb(button);
     if (mb == PL_MB_COUNT) {
-        LOG_WARNING("got invalid wl_pointer button code: %d", button);
+        LOG_WARN("got invalid wl_pointer button code: %d", button);
         return;
     }
 
@@ -520,7 +536,7 @@ static void wl_pointer_button(void *data, struct wl_pointer *wl_pointer,
             press_button(&bstate->curr_state->mouse.buttons[mb]);
             break;
         default:
-            LOG_WARNING("got invalid wl_pointer button state: %d", but_state);
+            LOG_WARN("got invalid wl_pointer button state: %d", but_state);
             return;
     }
     push_event(bstate, ev);
@@ -736,7 +752,7 @@ static void wl_keyboard_keymap(void *data, struct wl_keyboard *wl_keyboard,
     if (bstate->xkb_compose_table) {
         bstate->xkb_compose_state = xkb_compose_state_new(bstate->xkb_compose_table, XKB_COMPOSE_STATE_NO_FLAGS);
         if (!bstate->xkb_compose_state) {
-            LOG_WARNING("failed to create xkb_compose_state");
+            LOG_WARN("failed to create xkb_compose_state");
             return;
         }
     }
@@ -1079,29 +1095,45 @@ xdg_toplevel_decoration_listener = {
 static PLState* cache_state(PLState* state) {
     PLArenaAlloc* alloc = &state->_backend->frame_alloc;
     PLState* cstate = arena_alloc(alloc, sizeof(*state));
+    if (!cstate) {
+        set_error(PL_ERR_OOM);
+        LOG_FATAL("Failed to allocate cached state");
+        return NULL;
+    }
     memcpy(cstate, state, sizeof(*state));
     size_t wins_bytes = sizeof(*state->windows) * state->windows_cap;
     cstate->windows = arena_alloc(alloc, wins_bytes);
+    if (!cstate->windows) {
+        set_error(PL_ERR_OOM);
+        LOG_FATAL("Failed to allocate cached windows");
+        return NULL;
+    }
     memcpy(cstate->windows, state->windows, wins_bytes);
     for (PLWinID i = 0; i < state->windows_cap; i++) {
         if (!state->windows[i].valid) { continue; }
         if (!state->windows[i].title) { continue; }
         size_t title_len = strlen(state->windows[i].title) + 1;
         cstate->windows[i].title = arena_alloc(alloc, title_len);
+        if (!cstate->windows[i].title) {
+            set_error(PL_ERR_OOM);
+            LOG_FATAL("Failed to allocate cached window title");
+            return NULL;
+        }
         memcpy(cstate->windows[i].title, state->windows[i].title, title_len);
     }
     state->_backend->last_state = cstate;
     return cstate;
 }
 
-static void resize_windows(PLState* state, uint32_t new_cap) {
-    if (new_cap == state->windows_cap) { return; }
+static int32_t resize_windows(PLState* state, uint32_t new_cap) {
+    if (new_cap == state->windows_cap) { return 0; }
     PLWindow* new_wins = NULL;
     if (new_cap > 0) {
         new_wins = realloc(state->windows, new_cap * sizeof(*state->windows));
         if (!new_wins) {
+            set_error(PL_ERR_OOM);
             LOG_FATAL("failed to reallocate windows array");
-            return;
+            return -1;
         }
         if (new_cap > state->windows_cap) {
             PLWindow* uninit_wins = new_wins + state->windows_cap;
@@ -1113,34 +1145,40 @@ static void resize_windows(PLState* state, uint32_t new_cap) {
     }
     state->windows = new_wins;
     state->windows_cap = new_cap;
+    return 0;
 }
 
-static void init_backend_state(PLBackendState* bstate, PLState* state) {
-    if (!bstate) { return; }
+static int32_t init_backend_state(PLBackendState* bstate, PLState* state) {
+    assert(bstate);
+    assert(state);
     memset(bstate, 0, sizeof(*bstate));
 
     bstate->scroll_click_scale = 1.0 / 15.0;
 
     bstate->display = wl_display_connect(NULL);
     if (!bstate->display) {
+        set_error(PL_ERR_WINDOW_SYS);
         LOG_FATAL("failed to connect to wayland display");
-        return;
+        return -1;
     }
     bstate->registry = wl_display_get_registry(bstate->display);
     if (!bstate->display) {
+        set_error(PL_ERR_WINDOW_SYS);
         LOG_FATAL("failed to get wl_registry");
-        return;
+        return -1;
     }
     wl_registry_add_listener(bstate->registry, &wl_registry_listener, bstate);
     wl_display_roundtrip(bstate->display);
 
     if (!bstate->compositor) {
+        set_error(PL_ERR_WINDOW_SYS);
         LOG_FATAL("failed to get wl_compositor");
-        return;
+        return -1;
     }
     if (!bstate->xdg_wm_base) {
+        set_error(PL_ERR_WINDOW_SYS);
         LOG_FATAL("failed to get xdg_wm_base");
-        return;
+        return -1;
     }
     xdg_wm_base_add_listener(bstate->xdg_wm_base, &xdg_wm_base_listener, bstate);
 
@@ -1152,82 +1190,54 @@ static void init_backend_state(PLBackendState* bstate, PLState* state) {
     if (bstate->xkb_ctx) {
         bstate->xkb_compose_table = xkb_compose_table_new_from_locale(bstate->xkb_ctx, setlocale(LC_CTYPE, NULL), XKB_COMPOSE_COMPILE_NO_FLAGS);
         if (bstate->xkb_compose_table == NULL) {
-            LOG_WARNING("Failed to get xkb_compose_table");
+            LOG_WARN("Failed to get xkb_compose_table");
         }
     } else {
+        set_error(PL_ERR_WINDOW_SYS);
         LOG_ERROR("Failed to create xkb_context");
+        return -1;
     }
 
-    arena_init(&bstate->frame_alloc, 1, 4096);
-    arena_init(&bstate->bwin_alloc, 1, 4096);
+    if (!arena_init(&bstate->frame_alloc, 1, 4096)) {
+        set_error(PL_ERR_OOM);
+        LOG_FATAL("Failed to initialize frame allocator");
+        return -1;
+    }
+    if (!arena_init(&bstate->bwin_alloc, 1, 4096)) {
+        set_error(PL_ERR_OOM);
+        LOG_FATAL("Failed to initialize backend window allocator");
+        return -1;
+    }
 
     bstate->curr_state = state;
+    return 0;
 }
 
-void pl_init(PLState* state, PLErrorCallback error_callback) {
-    g_error_callback = error_callback;
-    if (!state) { return; }
+PLLogCallback pl_set_log_callback(PLLogCallback callback) {
+    PLLogCallback old = g_log_callback;
+    g_log_callback = callback;
+    return old;
+}
+
+int32_t pl_init(PLState* state) {
+    assert(state);
     memset(state, 0, sizeof(*state));
     state->_backend = calloc(1, sizeof(*state->_backend));
     if (!state->_backend) {
+        set_error(PL_ERR_OOM);
         LOG_FATAL("Failed to allocate backend state");
-        return;
+        return -1;
     }
-    init_backend_state(state->_backend, state);
-    resize_windows(state, 16);
-    cache_state(state);
-}
-
-static int poll_wayland_events(struct wl_display* display) {
-    struct pollfd pfd[1];
-    pfd[0].fd = wl_display_get_fd(display);
-    int ret = 0;
-
-    while (wl_display_prepare_read(display) == -1) {
-        ret = wl_display_dispatch_pending(display);
-        if (ret == -1) {
-            return ret;
-        }
+    if (init_backend_state(state->_backend, state)) {
+        return -1;
     }
-
-    ret = wl_display_flush(display);
-    if (ret == -1) {
-        if (errno == EAGAIN) {
-            pfd[0].events = POLLOUT;
-            do {
-                ret = poll(pfd, 1, -1);
-            } while (ret == -1 && errno == EINTR);
-            if (ret == -1) {
-                wl_display_cancel_read(display);
-                return ret;
-            }
-        } else if (errno != EPIPE) { // pipe closed, error event should be read
-            wl_display_cancel_read(display);
-            return ret;
-        }
+    if (resize_windows(state, 16)) {
+        return -1;
     }
-
-    while (true) {
-        pfd[0].events = POLLIN;
-        do {
-            ret = poll(pfd, 1, 0);
-        } while (ret == -1 && errno == EINTR);
-        if (ret <= 0) {
-            wl_display_cancel_read(display);
-            return ret;
-        }
-
-        ret = wl_display_read_events(display);
-        if (ret == -1) {
-            return ret;
-        }
-
-        if (wl_display_prepare_read(display) == -1) {
-            return wl_display_dispatch_pending(display);
-        }
-        // event queue doesn't have a full event. loop
-        // again to see if more data is available.
+    if (!cache_state(state)) {
+        return -1;
     }
+    return 0;
 }
 
 static PLBackendWindow* alloc_backend_window(PLBackendState* bstate) {
@@ -1266,7 +1276,7 @@ static void destroy_backend_window(PLBackendWindow* bwin) {
 }
 
 static void deinit_backend_state(PLBackendState* bstate) {
-    if (!bstate) { return; }
+    assert(bstate);
 
     if (bstate->last_state) {
         for (PLWinID id = 0; id < bstate->last_state->windows_cap; id++) {
@@ -1322,11 +1332,12 @@ static void deinit_backend_state(PLBackendState* bstate) {
     free(bstate);
 }
 
-void pl_deinit(PLState* state) {
-    if (!state) { return; }
+int32_t pl_deinit(PLState* state) {
+    assert(state);
     deinit_backend_state(state->_backend);
     resize_windows(state, 0);
     memset(state, 0, sizeof(*state));
+    return 0;
 }
 
 static PLBackendWindow* create_window(PLBackendState* bstate) {
@@ -1387,6 +1398,7 @@ static char* null_to_empty(char* str) {
 }
 
 static void update_window(PLBackendState* bstate, PLWinID id) {
+    assert(bstate);
     PLWindow* last = &bstate->last_state->windows[NULL_WINDOW];
     PLWindow* curr = &bstate->curr_state->windows[NULL_WINDOW];
     if (id < bstate->last_state->windows_cap) {
@@ -1421,7 +1433,63 @@ static void update_window(PLBackendState* bstate, PLWinID id) {
     }
 }
 
-void pl_update(PLState* state) {
+static int32_t poll_wayland_events(struct wl_display* display) {
+    struct pollfd pfd[1];
+    pfd[0].fd = wl_display_get_fd(display);
+    int ret = 0;
+
+    while (wl_display_prepare_read(display) == -1) {
+        ret = wl_display_dispatch_pending(display);
+        if (ret == -1) {
+            return ret;
+        }
+    }
+
+    ret = wl_display_flush(display);
+    if (ret == -1) {
+        if (errno == EAGAIN) {
+            pfd[0].events = POLLOUT;
+            do {
+                ret = poll(pfd, 1, -1);
+            } while (ret == -1 && errno == EINTR);
+            if (ret == -1) {
+                wl_display_cancel_read(display);
+                return ret;
+            }
+        } else if (errno != EPIPE) { // pipe closed, error event should be read
+            wl_display_cancel_read(display);
+            return ret;
+        }
+    }
+
+    while (true) {
+        pfd[0].events = POLLIN;
+        do {
+            ret = poll(pfd, 1, 0);
+        } while (ret == -1 && errno == EINTR);
+        if (ret <= 0) {
+            wl_display_cancel_read(display);
+            return ret;
+        }
+
+        ret = wl_display_read_events(display);
+        if (ret == -1) {
+            return ret;
+        }
+
+        if (wl_display_prepare_read(display) == -1) {
+            return wl_display_dispatch_pending(display);
+        }
+        // event queue doesn't have a full event. loop
+        // again to see if more data is available.
+    }
+}
+
+// TODO allow choice between polling or waiting on events
+// TODO should this be split into 2 funcs (read_events, send_requests)?
+// this prevents an extra 1 frame delay when updating fields before presenting
+// a buffer with vsync.
+int32_t pl_update(PLState* state) {
     PLBackendState* bstate = state->_backend;
     bstate->curr_state = state;
 
@@ -1439,7 +1507,7 @@ void pl_update(PLState* state) {
 
     // TODO separate this or smth
     // clear transients
-    bstate->curr_state->first_event = NULL;
+    bstate->curr_state->event_list = NULL;
     for (uint32_t i = 0; i < PL_MB_COUNT; i++) {
         PLButtonState* button = &bstate->curr_state->mouse.buttons[i];
         button->just_pressed = false;
@@ -1458,10 +1526,17 @@ void pl_update(PLState* state) {
     arena_defrag_pages(&bstate->frame_alloc);
 
     // read events & update curr_state (in callbacks)
-    poll_wayland_events(bstate->display);
+    if (poll_wayland_events(bstate->display) < 0) {
+        set_error(PL_ERR_WINDOW_SYS);
+        LOG_ERROR("failed to poll wayland events");
+        return -1;
+    }
 
     // cache states to compare deltas next update
-    cache_state(state);
+    if (!cache_state(state)) {
+        return -1;
+    }
+    return 0;
 }
 
 static PLWinID next_free_window_id(PLState* state) {

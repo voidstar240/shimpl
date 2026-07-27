@@ -299,24 +299,35 @@ typedef struct PLState {
     PLWindow* windows;
     uint32_t windows_cap;
 
-    PLEvent* first_event;
+    PLEvent* event_list;
 
     // TODO multiple input devices?
 
     struct PLBackendState* _backend;
 } PLState;
 
-typedef enum PLErrorSeverity {
-    PL_WARNING,
-    PL_ERROR,
+typedef enum PLLogLevel {
     PL_FATAL,
-} PLErrorSeverity;
+    PL_ERROR,
+    PL_WARN,
+    PL_INFO,
+} PLLogLevel;
 
-typedef void (*PLErrorCallback)(uint8_t severity, const char* message, const char* file, uint32_t line);
+typedef void (*PLLogCallback)(PLLogLevel level, const char* message, const char* file, uint32_t line);
 
-void pl_init(PLState* state, PLErrorCallback error_callback);
-void pl_update(PLState* state);
-void pl_deinit(PLState* state);
+typedef enum PLError {
+    PL_ERR_NONE = 0,
+    PL_ERR_OOM,
+    PL_ERR_WINDOW_SYS,
+    PL_ERR_INPUT_SYS,
+    PL_ERR_AUDIO_SYS,
+} PLError;
+
+uint32_t pl_last_error();
+PLLogCallback pl_set_log_callback(PLLogCallback callback);
+int32_t pl_init(PLState* state);
+int32_t pl_update(PLState* state);
+int32_t pl_deinit(PLState* state);
 
 PLWinID pl_open_window(PLState* state);
 

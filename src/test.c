@@ -27,9 +27,9 @@ bool input_mode = false;
 
 EGLConfig* configs;
 
-void err_cb(uint8_t sev, const char* msg, const char* file, uint32_t line) {
-    const char* sev_str[] = { "WARNING", "ERROR", "FATAL"};
-    fprintf(stderr, "[%s]: %s:%d: %s\n", sev_str[sev], file, line, msg);
+void err_cb(PLLogLevel level, const char* msg, const char* file, uint32_t line) {
+    const char* level_str[] = { "FATAL", "ERROR", "WARN", "INFO" };
+    fprintf(stderr, "[%s]: %s:%d: %s\n", level_str[level], file, line, msg);
 }
 
 int main(int argc, char* argv[]) {
@@ -37,19 +37,26 @@ int main(int argc, char* argv[]) {
     printf("Window Size = %zu bytes\n", sizeof(PLWindow));
     printf("Event Size  = %zu bytes\n", sizeof(PLEvent));
     PLState state;
-    pl_init(&state, err_cb);
+    pl_set_log_callback(err_cb);
+    if (pl_init(&state)) {
+        return -1;
+    }
 
     uint32_t win = pl_open_window(&state);
     state.windows[win].title = "ShimPL Test";
-    pl_update(&state);
+    if (pl_update(&state) < 0) {
+        return -1;
+    }
 
     init_egl(state._backend->display, state.windows[win]._backend->surface);
 
     eglSwapInterval(egl_display, 1);
     while (1) {
-        pl_update(&state);
+        if (pl_update(&state) < 0) {
+            return -1;
+        }
 
-        PLEvent* event = state.first_event;
+        PLEvent* event = state.event_list;
         for (; event; event = event->next) {
             if (event->type == PL_EV_MOUSE_MOTION) {
                 continue;
