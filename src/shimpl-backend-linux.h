@@ -33,12 +33,11 @@ typedef struct {
 } WlPointerEventGroup;
 
 typedef struct PLArenaAlloc {
-    struct ArenaPageHeader* first_page;
-    struct ArenaPageHeader* curr_page;
-    size_t page_usage;
-    size_t default_page_size;
-    size_t align;
-    size_t page_count;
+    void* start;
+    size_t next;
+    uint32_t reserved_pages;
+    uint32_t committed_pages;
+    uint8_t page_size_pot;
 } PLArenaAlloc;
 
 struct PLBackendState {
@@ -72,6 +71,7 @@ struct PLBackendState {
     PLArenaAlloc bwin_alloc;
     PLBackendWindow* bwin_free_list;
 
+    size_t last_state_mark;
     struct PLState* last_state; // last state sent to user
     struct PLState* curr_state; // current state containing user changes
 };

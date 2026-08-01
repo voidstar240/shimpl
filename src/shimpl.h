@@ -326,8 +326,10 @@ typedef enum PLError {
 uint32_t pl_last_error();
 PLLogCallback pl_set_log_callback(PLLogCallback callback);
 int32_t pl_init(PLState* state);
-int32_t pl_update(PLState* state);
 int32_t pl_deinit(PLState* state);
+
+int32_t pl_read_events(PLState* state);
+int32_t pl_update(PLState* state);
 
 PLWinID pl_open_window(PLState* state);
 

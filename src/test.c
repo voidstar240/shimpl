@@ -42,9 +42,12 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
+    if (pl_read_events(&state) < 0) {
+        return -1;
+    }
     uint32_t win = pl_open_window(&state);
     state.windows[win].title = "ShimPL Test";
-    if (pl_update(&state) < 0) {
+    if (pl_update(&state)) {
         return -1;
     }
 
@@ -52,7 +55,7 @@ int main(int argc, char* argv[]) {
 
     eglSwapInterval(egl_display, 1);
     while (1) {
-        if (pl_update(&state) < 0) {
+        if (pl_read_events(&state) < 0) {
             return -1;
         }
 
@@ -115,6 +118,10 @@ int main(int argc, char* argv[]) {
         }
         if (state.mouse.buttons[PL_MB_WHEELDOWN].just_released) {
             printf("PREV!\n");
+        }
+
+        if (pl_update(&state)) {
+            return -1;
         }
 
         if (width != state.windows[win].width

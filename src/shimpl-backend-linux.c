@@ -1,3 +1,4 @@
+#define _DEFAULT_SOURCE
 #include "shimpl.h"
 
 #define WAYLAND_PROTOCOLS_IMPLEMENTATION
@@ -9,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <linux/input-event-codes.h>
 #include <locale.h>
@@ -44,122 +46,85 @@ static void log_msg(PLLogLevel level, const char* file, uint32_t line) {
     }
 }
 
-typedef struct ArenaPageHeader {
-    struct ArenaPageHeader* next_page;
-    size_t page_size;
-} ArenaPageHeader;
-
-static void* arena_next_page(PLArenaAlloc* arena, size_t min_size) {
-    ArenaPageHeader* pre_new_page = arena->curr_page;
-    ArenaPageHeader* new_page = NULL;
-    if (pre_new_page) {
-        new_page = pre_new_page->next_page;
+static int32_t arena_init(PLArenaAlloc* arena, size_t reserved_bytes) {
+    arena->next = 0;
+    arena->committed_pages = 0;
+    int64_t page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        return -1;
     }
-
-    // find large enough unused page
-    while (new_page) {
-        if (new_page->page_size - sizeof(ArenaPageHeader) >= min_size) {
-            break;
+    uint8_t bits_set = 0;
+    arena->page_size_pot = 0;
+    while (page_size > 1) {
+        if (page_size & 1) {
+            bits_set++;
         }
-        pre_new_page = new_page;
-        new_page = new_page->next_page;
+        page_size >>= 1;
+        arena->page_size_pot++;
     }
-
-    // alloc new page if one couldn't be found
-    if (!new_page) {
-        size_t page_size = min_size + sizeof(ArenaPageHeader);
-        page_size += arena->default_page_size - 1;
-        page_size /= arena->default_page_size;
-        page_size *= arena->default_page_size;
-        new_page = calloc(1, page_size);
-        if (!new_page) {
-            return NULL;
-        }
-        if (pre_new_page) {
-            pre_new_page->next_page = new_page;
-        } else {
-            arena->first_page = new_page;
-        }
-        arena->page_count++;
+    if (bits_set > 0) {
+        return -1;
     }
-
-    // insert new_page after curr_page
-    if (pre_new_page && (pre_new_page != arena->curr_page)) {
-        ArenaPageHeader* curr_next_page = arena->curr_page->next_page;
-        ArenaPageHeader* new_next_page = new_page->next_page;
-        arena->curr_page->next_page = new_page;
-        new_page->next_page = curr_next_page;
-        pre_new_page->next_page = new_next_page;
-    }
-
-    arena->curr_page = new_page;
-    arena->page_usage = sizeof(ArenaPageHeader);
-    return new_page;
+    reserved_bytes += (1UL << arena->page_size_pot) - 1;
+    arena->reserved_pages = reserved_bytes >> arena->page_size_pot;
+    arena->start = mmap(NULL, reserved_bytes, PROT_NONE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return 0;
 }
 
-static void* arena_init(PLArenaAlloc* arena, size_t n_pages, size_t page_size) {
-    arena->first_page = NULL;
-    arena->curr_page = NULL;
-    arena->default_page_size = page_size;
-    arena->page_usage = 0;
-    arena->align = sizeof(void*);
-    arena->page_count = 0;
-    return arena_next_page(arena, n_pages * arena->default_page_size);
-}
+#define ARENA_ALIGN (size_t)(sizeof(void*))
 
 static void* arena_alloc(PLArenaAlloc* arena, size_t size) {
-    size_t rem_cap = 0;
-    if (arena->curr_page) {
-        rem_cap = arena->curr_page->page_size - arena->page_usage;
+    // TODO assert ARENA_ALIGN is 2^N
+    arena->next += ARENA_ALIGN - 1;
+    arena->next &= ~(ARENA_ALIGN - 1);
+    size_t req_pages = arena->next + size + (1UL << arena->page_size_pot) - 1;
+    req_pages >>= arena->page_size_pot;
+    if (req_pages > arena->reserved_pages) {
+        return NULL;
     }
-    if (size > rem_cap) {
-        if (!arena_next_page(arena, size)) {
+    if (req_pages > arena->committed_pages) {
+        size_t len = req_pages - arena->committed_pages;
+        len <<= arena->page_size_pot;
+        uint8_t* start = arena->start;
+        start += (size_t)arena->committed_pages << arena->page_size_pot;
+        int32_t res = mprotect(start, len, PROT_READ | PROT_WRITE);
+        if (res == -1) {
             return NULL;
         }
+        arena->committed_pages = req_pages;
+        // TODO poison new pages
     }
-    // round up to next alignment
-    arena->page_usage += arena->align - 1;
-    arena->page_usage /= arena->align;
-    arena->page_usage *= arena->align;
-    void* out_ptr = (uint8_t*)arena->curr_page + arena->page_usage;
-    arena->page_usage += size;
+    void* out_ptr = (uint8_t*)arena->start + arena->next;
+    arena->next += size;
     return out_ptr;
 }
 
-static void arena_reset(PLArenaAlloc* arena) {
-    arena->curr_page = arena->first_page;
-    arena->page_usage = sizeof(ArenaPageHeader);
+static size_t arena_mark(PLArenaAlloc* arena) {
+    return arena->next;
 }
 
-static void arena_free_pages(PLArenaAlloc* arena) {
-    while (arena->first_page) {
-        void* next = *(void**)arena->first_page;
-        free(arena->first_page);
-        arena->first_page = next;
+static void arena_rewind(PLArenaAlloc* arena, size_t mark) {
+    if (mark >= arena->next) { return; }
+    arena->next = mark;
+    if (arena->next < (size_t)arena->committed_pages << arena->page_size_pot) {
+        // TODO asan poison slack
     }
-    arena->curr_page = NULL;
-    arena->page_usage = 0;
-    arena->page_count = 0;
-};
+}
 
-static void* arena_defrag_pages(PLArenaAlloc* arena) {
-    if (arena->page_count <= 1) {
-        return arena->first_page;
+static void arena_free_slack(PLArenaAlloc* arena) {
+    size_t req_pages = arena->next + (1UL << arena->page_size_pot) - 1;
+    req_pages >>= arena->page_size_pot;
+    if (req_pages < arena->committed_pages) {
+        size_t len = arena->committed_pages - req_pages;
+        len <<= arena->page_size_pot;
+        uint8_t* start = arena->start;
+        start += req_pages << arena->page_size_pot;
+        // prevent access to pages and return pages to kernel
+        mprotect(start, len, PROT_NONE);
+        madvise(start, len, MADV_DONTNEED);
+        arena->committed_pages = req_pages;
     }
-    ArenaPageHeader* page = arena->first_page;
-    size_t total_size = 0;
-    for (; page; page = page->next_page) {
-        total_size += page->page_size;
-    }
-    arena_free_pages(arena);
-    // round up to page size
-    total_size += arena->default_page_size - 1;
-    total_size /= arena->default_page_size;
-    total_size *= arena->default_page_size;
-    arena->first_page = calloc(1, total_size);
-    arena->curr_page = arena->first_page;
-    arena->page_usage = sizeof(ArenaPageHeader);
-    return arena->first_page;
 }
 
 static uint32_t g_pl_errno = PL_ERR_NONE;
@@ -172,6 +137,8 @@ static void set_error(PLError error) {
 uint32_t pl_last_error() {
     return g_pl_errno;
 }
+
+static uint32_t g_event_count = 0;
 
 static void push_event(PLBackendState* bstate, PLEvent ev) {
     static PLEvent* last_event;
@@ -187,6 +154,7 @@ static void push_event(PLBackendState* bstate, PLEvent ev) {
         last_event->next = ev_alloc;
     }
     last_event = ev_alloc;
+    g_event_count++;
 }
 
 static void press_button(PLButtonState* button) {
@@ -1094,6 +1062,7 @@ xdg_toplevel_decoration_listener = {
 
 static PLState* cache_state(PLState* state) {
     PLArenaAlloc* alloc = &state->_backend->frame_alloc;
+    arena_rewind(alloc, state->_backend->last_state_mark);
     PLState* cstate = arena_alloc(alloc, sizeof(*state));
     if (!cstate) {
         set_error(PL_ERR_OOM);
@@ -1198,12 +1167,13 @@ static int32_t init_backend_state(PLBackendState* bstate, PLState* state) {
         return -1;
     }
 
-    if (!arena_init(&bstate->frame_alloc, 1, 4096)) {
+    size_t GiB = 1024UL * 1024UL * 1024UL;
+    if (arena_init(&bstate->frame_alloc, 16UL * GiB)) {
         set_error(PL_ERR_OOM);
         LOG_FATAL("Failed to initialize frame allocator");
         return -1;
     }
-    if (!arena_init(&bstate->bwin_alloc, 1, 4096)) {
+    if (arena_init(&bstate->bwin_alloc, 1024 * sizeof(PLBackendWindow))) {
         set_error(PL_ERR_OOM);
         LOG_FATAL("Failed to initialize backend window allocator");
         return -1;
@@ -1327,8 +1297,10 @@ static void deinit_backend_state(PLBackendState* bstate) {
     if (bstate->display) {
         wl_display_disconnect(bstate->display);
     }
-    arena_free_pages(&bstate->frame_alloc);
-    arena_free_pages(&bstate->bwin_alloc);
+    arena_rewind(&bstate->frame_alloc, 0);
+    arena_free_slack(&bstate->frame_alloc);
+    arena_rewind(&bstate->bwin_alloc, 0);
+    arena_free_slack(&bstate->bwin_alloc);
     free(bstate);
 }
 
@@ -1486,24 +1458,9 @@ static int32_t poll_wayland_events(struct wl_display* display) {
 }
 
 // TODO allow choice between polling or waiting on events
-// TODO should this be split into 2 funcs (read_events, send_requests)?
-// this prevents an extra 1 frame delay when updating fields before presenting
-// a buffer with vsync.
-int32_t pl_update(PLState* state) {
+int32_t pl_read_events(PLState* state) {
     PLBackendState* bstate = state->_backend;
     bstate->curr_state = state;
-
-    // windows[0] must be 0 filled
-    memset(&state->windows[NULL_WINDOW], 0, sizeof(*state->windows));
-
-    // enact changes based on last -> curr state delta
-    uint32_t max_cap = state->windows_cap;
-    if (bstate->last_state->windows_cap > max_cap) {
-        max_cap = bstate->last_state->windows_cap;
-    }
-    for (PLWinID id = FIRST_WIN_ID; id < max_cap; id++) {
-        update_window(bstate, id);
-    }
 
     // TODO separate this or smth
     // clear transients
@@ -1522,8 +1479,7 @@ int32_t pl_update(PLState* state) {
         button->repeat = false;
         button->extra_presses = 0;
     }
-    arena_reset(&bstate->frame_alloc);
-    arena_defrag_pages(&bstate->frame_alloc);
+    arena_rewind(&bstate->frame_alloc, 0);
 
     // read events & update curr_state (in callbacks)
     if (poll_wayland_events(bstate->display) < 0) {
@@ -1531,8 +1487,34 @@ int32_t pl_update(PLState* state) {
         LOG_ERROR("failed to poll wayland events");
         return -1;
     }
+    bstate->last_state_mark = arena_mark(&bstate->frame_alloc);
 
-    // cache states to compare deltas next update
+    // cache state to compare deltas next update
+    if (!cache_state(state)) {
+        return -1;
+    }
+    int32_t ev_count = g_event_count;
+    g_event_count = 0;
+    return ev_count;
+}
+
+int32_t pl_update(PLState* state) {
+    PLBackendState* bstate = state->_backend;
+    bstate->curr_state = state;
+
+    // windows[0] must be 0 filled
+    memset(&state->windows[NULL_WINDOW], 0, sizeof(*state->windows));
+
+    // enact changes based on last -> curr state delta
+    uint32_t max_cap = state->windows_cap;
+    if (bstate->last_state->windows_cap > max_cap) {
+        max_cap = bstate->last_state->windows_cap;
+    }
+    for (PLWinID id = FIRST_WIN_ID; id < max_cap; id++) {
+        update_window(bstate, id);
+    }
+
+    // cache state to avoid duplicate requests on consecutive calls to update
     if (!cache_state(state)) {
         return -1;
     }
