@@ -38,7 +38,7 @@ int main(int argc, char* argv[]) {
     printf("Event Size  = %zu bytes\n", sizeof(PLEvent));
     PLState state;
     pl_set_log_callback(err_cb);
-    if (pl_init(&state)) {
+    if (!pl_init(&state)) {
         return -1;
     }
 
@@ -47,7 +47,7 @@ int main(int argc, char* argv[]) {
     }
     uint32_t win = pl_open_window(&state);
     state.windows[win].title = "ShimPL Test";
-    if (pl_update(&state)) {
+    if (!pl_update(&state)) {
         return -1;
     }
 
@@ -120,7 +120,7 @@ int main(int argc, char* argv[]) {
             printf("PREV!\n");
         }
 
-        if (pl_update(&state)) {
+        if (!pl_update(&state)) {
             return -1;
         }
 

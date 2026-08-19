@@ -46,12 +46,12 @@ static void log_msg(PLLogLevel level, const char* file, uint32_t line) {
     }
 }
 
-static int32_t arena_init(PLArenaAlloc* arena, size_t reserved_bytes) {
+static bool arena_init(PLArenaAlloc* arena, size_t reserved_bytes) {
     arena->next = 0;
     arena->committed_pages = 0;
     int64_t page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
-        return -1;
+        return false;
     }
     uint8_t bits_set = 0;
     arena->page_size_pot = 0;
@@ -63,13 +63,13 @@ static int32_t arena_init(PLArenaAlloc* arena, size_t reserved_bytes) {
         arena->page_size_pot++;
     }
     if (bits_set > 0) {
-        return -1;
+        return false;
     }
     reserved_bytes += (1UL << arena->page_size_pot) - 1;
     arena->reserved_pages = reserved_bytes >> arena->page_size_pot;
     arena->start = mmap(NULL, reserved_bytes, PROT_NONE,
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    return 0;
+    return true;
 }
 
 #define ARENA_ALIGN (size_t)(sizeof(void*))
@@ -1094,7 +1094,7 @@ static PLState* cache_state(PLState* state) {
     return cstate;
 }
 
-static int32_t resize_windows(PLState* state, uint32_t new_cap) {
+static bool resize_windows(PLState* state, uint32_t new_cap) {
     if (new_cap == state->windows_cap) { return 0; }
     PLWindow* new_wins = NULL;
     if (new_cap > 0) {
@@ -1102,7 +1102,7 @@ static int32_t resize_windows(PLState* state, uint32_t new_cap) {
         if (!new_wins) {
             set_error(PL_ERR_OOM);
             LOG_FATAL("failed to reallocate windows array");
-            return -1;
+            return false;
         }
         if (new_cap > state->windows_cap) {
             PLWindow* uninit_wins = new_wins + state->windows_cap;
@@ -1114,10 +1114,10 @@ static int32_t resize_windows(PLState* state, uint32_t new_cap) {
     }
     state->windows = new_wins;
     state->windows_cap = new_cap;
-    return 0;
+    return true;
 }
 
-static int32_t init_backend_state(PLBackendState* bstate, PLState* state) {
+static bool init_backend_state(PLBackendState* bstate, PLState* state) {
     assert(bstate);
     assert(state);
     memset(bstate, 0, sizeof(*bstate));
@@ -1128,13 +1128,13 @@ static int32_t init_backend_state(PLBackendState* bstate, PLState* state) {
     if (!bstate->display) {
         set_error(PL_ERR_WINDOW_SYS);
         LOG_FATAL("failed to connect to wayland display");
-        return -1;
+        return false;
     }
     bstate->registry = wl_display_get_registry(bstate->display);
     if (!bstate->display) {
         set_error(PL_ERR_WINDOW_SYS);
         LOG_FATAL("failed to get wl_registry");
-        return -1;
+        return false;
     }
     wl_registry_add_listener(bstate->registry, &wl_registry_listener, bstate);
     wl_display_roundtrip(bstate->display);
@@ -1142,12 +1142,12 @@ static int32_t init_backend_state(PLBackendState* bstate, PLState* state) {
     if (!bstate->compositor) {
         set_error(PL_ERR_WINDOW_SYS);
         LOG_FATAL("failed to get wl_compositor");
-        return -1;
+        return false;
     }
     if (!bstate->xdg_wm_base) {
         set_error(PL_ERR_WINDOW_SYS);
         LOG_FATAL("failed to get xdg_wm_base");
-        return -1;
+        return false;
     }
     xdg_wm_base_add_listener(bstate->xdg_wm_base, &xdg_wm_base_listener, bstate);
 
@@ -1164,23 +1164,23 @@ static int32_t init_backend_state(PLBackendState* bstate, PLState* state) {
     } else {
         set_error(PL_ERR_WINDOW_SYS);
         LOG_ERROR("Failed to create xkb_context");
-        return -1;
+        return false;
     }
 
     size_t GiB = 1024UL * 1024UL * 1024UL;
-    if (arena_init(&bstate->frame_alloc, 16UL * GiB)) {
+    if (!arena_init(&bstate->frame_alloc, 16UL * GiB)) {
         set_error(PL_ERR_OOM);
         LOG_FATAL("Failed to initialize frame allocator");
-        return -1;
+        return false;
     }
-    if (arena_init(&bstate->bwin_alloc, 1024 * sizeof(PLBackendWindow))) {
+    if (!arena_init(&bstate->bwin_alloc, 1024 * sizeof(PLBackendWindow))) {
         set_error(PL_ERR_OOM);
         LOG_FATAL("Failed to initialize backend window allocator");
-        return -1;
+        return false;
     }
 
     bstate->curr_state = state;
-    return 0;
+    return true;
 }
 
 PLLogCallback pl_set_log_callback(PLLogCallback callback) {
@@ -1189,25 +1189,25 @@ PLLogCallback pl_set_log_callback(PLLogCallback callback) {
     return old;
 }
 
-int32_t pl_init(PLState* state) {
+bool pl_init(PLState* state) {
     assert(state);
     memset(state, 0, sizeof(*state));
     state->_backend = calloc(1, sizeof(*state->_backend));
     if (!state->_backend) {
         set_error(PL_ERR_OOM);
         LOG_FATAL("Failed to allocate backend state");
-        return -1;
+        return false;
     }
-    if (init_backend_state(state->_backend, state)) {
-        return -1;
+    if (!init_backend_state(state->_backend, state)) {
+        return false;
     }
-    if (resize_windows(state, 16)) {
-        return -1;
+    if (!resize_windows(state, 16)) {
+        return false;
     }
     if (!cache_state(state)) {
-        return -1;
+        return false;
     }
-    return 0;
+    return true;
 }
 
 static PLBackendWindow* alloc_backend_window(PLBackendState* bstate) {
@@ -1304,12 +1304,11 @@ static void deinit_backend_state(PLBackendState* bstate) {
     free(bstate);
 }
 
-int32_t pl_deinit(PLState* state) {
+void pl_deinit(PLState* state) {
     assert(state);
     deinit_backend_state(state->_backend);
     resize_windows(state, 0);
     memset(state, 0, sizeof(*state));
-    return 0;
 }
 
 static PLBackendWindow* create_window(PLBackendState* bstate) {
@@ -1498,7 +1497,7 @@ int32_t pl_read_events(PLState* state) {
     return ev_count;
 }
 
-int32_t pl_update(PLState* state) {
+bool pl_update(PLState* state) {
     PLBackendState* bstate = state->_backend;
     bstate->curr_state = state;
 
@@ -1516,9 +1515,9 @@ int32_t pl_update(PLState* state) {
 
     // cache state to avoid duplicate requests on consecutive calls to update
     if (!cache_state(state)) {
-        return -1;
+        return false;
     }
-    return 0;
+    return true;
 }
 
 static PLWinID next_free_window_id(PLState* state) {
